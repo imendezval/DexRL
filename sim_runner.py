@@ -35,7 +35,7 @@ import gevent
 import isaaclab.sim as sim_utils
 from scene import FrankaScene, FrankaSceneCfg
 
-from pick_utils import Grasp, offset_target_pos
+from helpers import Grasp, offset_target_pos
 
 
 # ─────────────────────
@@ -121,7 +121,7 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
             gripper_def_pos = joint_pos_gripper[0][0].item()
 
             scene.reset()
-            print("[INFO] Franka reset.")
+            scene.logger.info("Franka Reset.")
 
         # ──────────────────
         # Picking Sequence
@@ -147,8 +147,8 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
 
             TP_setup2_W = offset_target_pos(grasps[0].setup_pos, target_rot, offset_local)
             target_rot_pick = grasps[0].rot_global
-            for grasp in grasps:
-                print(grasp)
+            # for grasp in grasps:
+            #     print(grasp)
             q_target = scene.compute_IK(TP_setup2_W, grasps[0].rot_global)
 
             scene.mode = 1
@@ -234,7 +234,7 @@ def main():
     scene.setup_post_load()
 
     sim.reset() 
-    print("[INFO] Setup complete… running!")
+    scene.logger.info("Setup complete.")
     pick_cube(sim, scene)
 
 

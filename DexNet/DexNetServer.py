@@ -4,7 +4,7 @@ from gevent.pywsgi import WSGIServer
 import base64
 
 from DexNet.DexNetWrapper import DexNetWrapper
-from constants import DexNet
+from constants import DexNet, Settings
 
 
 app = Flask(__name__)
@@ -21,10 +21,10 @@ def process():
         dtype=np.dtype(payload["dtype"])
     ).reshape(payload["shape"])
 
-    grasps      = DexNetModel(depth_im)
+    grasps      = DexNetModel(depth_im, Settings.vis_DexNet)
     grasps_np   = DexNetModel.reformat_grasps(grasps)
 
-    print(grasps_np)
+    # print(grasps_np)
 
     return jsonify(
         shape=list(grasps_np.shape),
@@ -33,5 +33,5 @@ def process():
     )
 
 if __name__ == "__main__":
-    print(f"⇢ Serving on {DexNet.url}")
+    DexNetModel.logger.info(f"⇢ Serving on {DexNet.url}")
     WSGIServer((DexNet.host, DexNet.port_num), app).serve_forever()

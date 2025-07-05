@@ -154,10 +154,12 @@ def mat_to_quat(R, *, tol=1e-8):
     q = np.array([w, x, y, z])
     return q / np.linalg.norm(q)
 
+
 def wxyz_to_xyzw(q):
     """[w x y z]  ->  [x y z w]"""
     w, x, y, z = q
     return np.array([x, y, z, w], dtype=q.dtype)
+
 
 def xyzw_to_wxyz(q):
     """[x y z w]  ->  [w x y z]"""

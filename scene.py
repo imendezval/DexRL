@@ -36,7 +36,7 @@ from isaacsim.core.prims import SingleArticulation
 
 
 from constants import Camera, Prims, RobotArm, DexNet
-from pick_utils import Grasp, mat_to_quat
+from helpers import Grasp, mat_to_quat
 
 
 dir_ = os.path.dirname(os.path.realpath(__file__))
@@ -89,7 +89,7 @@ class FrankaSceneCfg(InteractiveSceneCfg):
             collision_props=sim_utils.CollisionPropertiesCfg(),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.64, 0.32, 1.15)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.6, 0.3, 1.15)),
     )
 
     # Articulations
@@ -225,7 +225,8 @@ class FrankaScene(InteractiveScene):
 
         is_target_reached = np.allclose(ee_position, target_pos, atol=atol) \
                         and np.allclose(ee_rot, target_rot, atol=atol)
-        print(ee_rot, target_rot)
+        # print(ee_rot, target_rot)
+        # print(ee_position, target_pos)
         # print(np.abs(target_pos-ee_position))
 
         return is_target_reached

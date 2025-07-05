@@ -16,7 +16,7 @@ class DexNetWrapper(object):
 
     def __init__(self):
 
-        self.logger = Logger.get_logger("dex_net_inference.py")
+        self.logger = Logger.get_logger("Dex-Net Server")
 
         self.dir_ = os.path.dirname(os.path.realpath(__file__))
         self.dir_gqcnn = os.path.join(self.dir_, "gqcnn")
@@ -43,11 +43,15 @@ class DexNetWrapper(object):
         self.policy = FullyConvolutionalGraspingPolicyParallelJaw(self.policy_config)
 
 
-    def __call__(self, depth_im):
+    def __call__(self, depth_im, vis = False):
         
-        self.state = self.create_state(depth_im)
+        self.state, rgbd_im = self.create_state(depth_im)
 
-        return self.predict_grasps()
+        grasps = self.predict_grasps()
+        if vis:
+            self.visualize_grasps(grasps, rgbd_im)
+
+        return grasps
     
 
     def _get_filenames(self):
@@ -75,7 +79,7 @@ class DexNetWrapper(object):
 
         # Create state
         rgbd_im = RgbdImage.from_color_and_depth(color_im, depth_im)
-        return RgbdImageState(rgbd_im, self.camera_intr, segmask=self.segmask)
+        return RgbdImageState(rgbd_im, self.camera_intr, segmask=self.segmask), rgbd_im
 
 
     def predict_grasps(self):
@@ -100,3 +104,17 @@ class DexNetWrapper(object):
         
         rows = np.asarray(rows, dtype=np.float32)
         return rows
+    
+
+    def visualize_grasps(self, actions, rgbd_im):
+
+        vis.figure(size=(10, 10))
+        vis.imshow(rgbd_im.depth,
+                    vmin=self.policy_config["vis"]["vmin"],
+                    vmax=self.policy_config["vis"]["vmax"])
+        # for action in actions:
+            # vis.grasp(action.grasp, scale=2.5, show_center=False, show_axis=True)
+        vis.grasp(actions[0].grasp, scale=2.5, show_center=False, show_axis=True)
+        vis.title("Planned grasp at depth {0:.3f}m with Q={1:.3f}".format(
+            actions[0].grasp.depth, actions[0].q_value))
+        vis.show()

@@ -1,5 +1,9 @@
 import numpy as np
 
+class Settings:
+    vis_DexNet      = True
+
+
 class Camera:
     height          = 386
     width           = 516
@@ -41,6 +45,7 @@ class RobotArm:
 
 class Poses:
     basic_rot       = np.array([0, 0.3826834 ,0.9238795,0])
+
 
 class DexNet:
     host            = "0.0.0.0"
