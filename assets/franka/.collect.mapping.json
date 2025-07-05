@@ -1,0 +1,23 @@
+{
+    "version": "1.0",
+    "file_records": [
+        {
+            "source_url": "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Robots/Franka/franka_instanceable.usd",
+            "source_hash": "80930820b36cfeffe3de9ec15d64434993b07e04",
+            "target_url": "./franka_instanceable.usd",
+            "target_hash": "e9aca9aeac22c0d162e27517bf100881851e5e0e"
+        },
+        {
+            "source_url": "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Robots/Franka/franka_collisions.usd",
+            "source_hash": "420c223e33a581fd700e26f2418302952e226adb",
+            "target_url": "./franka_collisions.usd",
+            "target_hash": "5793fbf70c9ba0c2525471270fa516b10331fe36"
+        },
+        {
+            "source_url": "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Robots/Franka/franka_visuals.usd",
+            "source_hash": "11b3cfdb14e85909c9e426223436d9971d053040",
+            "target_url": "./franka_visuals.usd",
+            "target_hash": "8d740519bf7761dc990f454e3d558aa1f6bf0295"
+        }
+    ]
+}
