@@ -4,9 +4,13 @@ np.set_printoptions(suppress=True)
 import os, types, logging
 import base64, grequests
 import torch
+import random, math
 
 
 import isaaclab.sim as sim_utils
+import isaacsim.core.utils.prims as prim_utils
+
+import omni.physics.tensors.impl.api as physx
 
 # Interactive Scene Class
 from isaaclab.utils import configclass
@@ -15,11 +19,12 @@ from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 # CFGs
 from cfg.franka_cfg import FRANKA_PANDA_HIGH_PD_CFG
 from cfg.gripper_cfg import YUMI_CFG
-from isaaclab.assets import AssetBaseCfg, RigidObjectCfg #, Articulation
+from isaaclab.assets import AssetBaseCfg, RigidObjectCfg, RigidObjectCollectionCfg#, Articulation
 from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.sensors import CameraCfg, TiledCameraCfg
 from isaaclab.sensors import ContactSensorCfg
 import isaaclab.sim.schemas as sim_schemas
+from isaaclab.sim.spawners.spawner_cfg import SpawnerCfg
 
 ### Extensions
 from isaacsim.core.utils.extensions import enable_extension
@@ -35,11 +40,60 @@ from isaacsim.robot_motion.motion_generation import interface_config_loader
 from isaacsim.core.prims import SingleArticulation
 
 
-from constants import Camera, Prims, RobotArm, DexNet
 from helpers import Grasp, mat_to_quat
+from constants import Camera, Prims, RobotArm, DexNet, Settings
+
+ObjPool = Prims.ObjPool
+
 
 
 dir_ = os.path.dirname(os.path.realpath(__file__))
+
+
+# @configclass
+# class XformCfg(SpawnerCfg):
+#     func = staticmethod(lambda prim_path, cfg,
+#                         translation=None, orientation=None:
+#                         prim_utils.create_prim(prim_path, "Xform",
+#                                                translation, orientation))
+
+class ObjectPool(object):
+
+    def __init__(self):
+
+        # TODO: Generate Prims.ObjPool.n_obj_pool random objects from folders only
+        pool_path = os.path.join(dir_, ObjPool.path)
+        self.object_pool_cfg = {}
+
+        gird_size = round(math.sqrt(ObjPool.n_obj_pool))
+        spacing = 0.1
+
+        for i, USD_file in enumerate(os.scandir(pool_path)):
+
+            if not USD_file.is_file() or os.path.splitext(USD_file.name)[1] != ".usd":
+                continue
+            
+            col = i // gird_size
+            row = i  % gird_size
+
+            usd_path = os.path.join(pool_path, USD_file)
+
+            cfg = RigidObjectCfg(
+                prim_path=f"{{ENV_REGEX_NS}}/obj_{i}",
+                spawn=sim_utils.UsdFileCfg(
+                    usd_path=usd_path,
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
+                    mass_props=sim_utils.MassPropertiesCfg(mass=0.25),
+                    collision_props=sim_utils.CollisionPropertiesCfg(),
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(random.random(), random.random(), random.random()), metallic=0.2),                    
+                ),
+                init_state=RigidObjectCfg.InitialStateCfg(pos=(row * spacing, 0.65 + col * spacing, 0)),
+            )
+
+            self.object_pool_cfg[f"obj_{i}"] = cfg
+
+            i += 1
+
 
 
 @configclass
@@ -52,7 +106,7 @@ class FrankaSceneCfg(InteractiveSceneCfg):
         prim_path="/World/Light", spawn=sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
     )
 
-    # Prims
+    # Base Scene
     table = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Table",
         spawn=sim_utils.UsdFileCfg(
@@ -90,6 +144,16 @@ class FrankaSceneCfg(InteractiveSceneCfg):
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.6, 0.3, 1.15)),
+    )
+    
+    # Object Pool
+    # helpers_folder = AssetBaseCfg(
+    #     prim_path="{ENV_REGEX_NS}/ObjPool",
+    #     spawn=XformCfg()
+    # )
+
+    obj_pool = RigidObjectCollectionCfg(
+                rigid_objects=ObjectPool().object_pool_cfg
     )
 
     # Articulations
@@ -131,7 +195,7 @@ class FrankaScene(InteractiveScene):
         self._kinematics_solver = None
         self._articulation_kinematics_solvers = []
 
-        self.mode = 0
+        self.mode = -1
 
         self.DexNet_request = None
         self.is_request = False
@@ -282,3 +346,175 @@ class FrankaScene(InteractiveScene):
         grasps = [Grasp(row) for row in grasps_np]
 
         return grasps
+    
+    
+    def generate_objects(self, env_id):
+        # (remove 20 previous)
+        ...
+
+        N = ObjPool.n_objs_ep
+
+        # Generate list of 20
+        obj_list = sorted(
+                    random.sample(range(0, ObjPool.n_obj_pool), N))
+
+        # Get Physx View
+        obj_pool    = self.rigid_object_collections["obj_pool"]
+        view        = obj_pool.root_physx_view
+
+        env_id  = torch.tensor([env_id], device=self.device)
+        obj_ids = torch.tensor(obj_list, device=self.device)
+
+        view_ids = obj_pool._env_obj_ids_to_view_ids(env_id, obj_ids)
+
+        # Randomise Domain
+        # self._randomise_friction(N, view, view_ids, device)
+
+        # self._randomise_mass(N, view, view_ids, device)
+
+        self._randomise_poses(N, env_id, obj_ids)
+
+
+        # Visibility???
+        ...
+
+
+    def _randomise_friction(self, N: int, view: physx.RigidBodyView, view_ids):
+
+        S = view.max_shapes
+
+        mean_fric = torch.tensor([ObjPool.mu_static,
+                                  ObjPool.mu_dynamic],
+                                dtype=torch.float32).view(1, 2).expand(N, 2)
+        
+        std_fric  = torch.full_like(mean_fric, ObjPool.sigma)
+
+        friction = torch.normal(mean_fric, std_fric)
+
+        mean_rest = torch.full((N, 1), ObjPool.mu_rest,  dtype=torch.float32)
+        std_rest  = torch.full((N, 1), ObjPool.sigma_rest, dtype=torch.float32)
+
+        restitution = torch.normal(mean_rest, std_rest)
+        # TODO: Static > Dynamic
+
+        # friction = torch.normal(
+        #     mean=torch.tensor([Prims.ObjPool.mu_static, 
+        #                        Prims.ObjPool.mu_dynamic],
+        #                     dtype=torch.float32, device="cpu"),
+        #     std=torch.tensor([Prims.ObjPool.sigma, 
+        #                       Prims.ObjPool.sigma],
+        #                     dtype=torch.float32, device="cpu"),
+        #     size=(N, 2))
+            
+        # restitution = torch.normal(
+        #     mean=torch.tensor([Prims.ObjPool.mu_rest],
+        #                     dtype=torch.float32, device="cpu"),
+        #     std=torch.tensor([Prims.ObjPool.sigma_rest],
+        #                     dtype=torch.float32, device="cpu"),
+        #     size=(N, 1))
+        
+        properties = torch.cat([friction, restitution], dim=1) # (N, 3)
+        properties = properties.unsqueeze(1)                   # (N, 1, 3)
+        properties = properties.expand(N, S, 3).clone()        # (N, S, 3)
+
+        view.set_material_properties(properties, indices=view_ids.to(torch.uint32))
+
+
+    def _randomise_mass(self, N: int, view: physx.RigidBodyView, view_ids):
+
+        mass = torch.normal(
+            mean=torch.tensor([ObjPool.mu_mass],
+                            dtype=torch.float32, device=self.device),
+            std=torch.tensor([ObjPool.sigma_mass],
+                            dtype=torch.float32, device=self.device),
+            size=(N, 1))
+
+        view.set_masses(mass, indices=view_ids.to(torch.uint32))
+
+
+    def _randomise_poses(self, N, env_id, obj_ids):
+
+        xy = self._sample_discrete_xy_bins(ObjPool.x_bins, 
+                                           ObjPool.y_bins, 
+                                           ObjPool.spacing,
+                                           ObjPool.pos_x,
+                                           ObjPool.pos_y,
+                                           N, env_id)
+
+        z  = torch.empty((N, 1), device=self.device).uniform_(ObjPool.z_min, ObjPool.z_max)
+        
+        poses_3d    = torch.cat([xy, z], dim=1)           # (N, 3)
+
+        quartenions = self._sample_uniform_quaternions(N) # (N, 4)
+
+        object_poses = torch.cat([poses_3d, quartenions], dim=1) # (N, 7)
+        object_poses = object_poses.unsqueeze(0)                 # (1, N, 7)
+       
+        self.rigid_object_collections["obj_pool"].write_object_pose_to_sim(object_poses, env_id, obj_ids)
+    
+    
+    def _sample_discrete_xy_bins(self,
+                                n_bins_x: int,
+                                n_bins_y: int,
+                                spacing: float,
+                                x0: float,
+                                y0: float,
+                                N: int,
+                                env_id):
+        """
+        Pick N unique (x,y) bins on a regular grid.
+
+        Parameters
+        ----------
+        n_bins_x, n_bins_y : int
+            Number of bins along each axis.
+        N : int
+            How many unique positions you need.
+        """
+
+        x0_env = x0 + self.env_origins[env_id, 0]
+        y0_env = y0 + self.env_origins[env_id, 1]
+
+        # (n_bins_x · n_bins_y, 2) table of (i,j) integer indices
+        ij = torch.stack(torch.meshgrid(
+                torch.arange(n_bins_x, device=self.device),
+                torch.arange(n_bins_y, device=self.device),
+                indexing="ij"), dim=-1
+            ).reshape(-1, 2)
+
+        # take N different rows without replacement
+        chosen = ij[torch.randperm(ij.size(0), device=self.device)[:N]]
+
+        # convert bin indices to metric coordinates
+        xy = (chosen.float() + 0.5) * spacing
+        xy += torch.tensor([x0_env, y0_env], device=self.device)
+        return xy
+
+
+    def _sample_uniform_quaternions(self, N: int):
+        """
+        Marsaglia 1972 method — uniform over SO(3).
+
+        Returns
+        -------
+        q : torch.Tensor, shape (N, 4)  (w, x, y, z)
+        """
+        u1, u2, u3 = torch.rand(3, N, device=self.device)
+
+        q = torch.zeros((N, 4), device=self.device)
+        q[:, 0] = torch.sqrt(1.0 - u1) * torch.sin(2 * math.pi * u2)   # x
+        q[:, 1] = torch.sqrt(1.0 - u1) * torch.cos(2 * math.pi * u2)   # y
+        q[:, 2] = torch.sqrt(     u1) * torch.sin(2 * math.pi * u3)    # z
+        q[:, 3] = torch.sqrt(     u1) * torch.cos(2 * math.pi * u3)    # w
+        return q[:, (3, 0, 1, 2)]
+    
+
+    def move_obj(self, env_id):
+
+        rigid_obj = self.rigid_objects["cube"].root_physx_view
+        env_id             = torch.tensor([env_id], dtype=torch.uint32)  # env_idx.to(torch.uint32)
+        mat                = rigid_obj.get_material_properties()
+        mat[env_id, :, :2] = torch.tensor([0, 0],
+                                           dtype=mat.dtype,
+                                           device=mat.device)    
+        rigid_obj.set_material_properties(mat, env_id)

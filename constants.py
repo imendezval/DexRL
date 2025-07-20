@@ -2,6 +2,9 @@ import numpy as np
 
 class Settings:
     vis_DexNet      = True
+    
+    num_envs        = 4
+    env_spacing     = 3.0
 
 
 class Camera:
@@ -32,6 +35,29 @@ class Prims:
         pos_pick    = (0.6, 0.3, 1.12)
         pos_place   = (0.6, -0.3, 1.12)
 
+    class ObjPool:
+        path        = "assets/meshes/USD/kit"
+        n_obj_pool  = 129
+        n_objs_ep   = 12
+
+        pos_x       = 0.5
+        pos_y       = 0.2
+        x_bins      = 3
+        y_bins      = 5
+        spacing     = 0.06
+        z_min       = 1.15
+        z_max       = 1.35
+
+        mu_static   = 1.20
+        mu_dynamic  = 0.10
+        sigma       = 0.10
+
+        mu_rest     = 0.05
+        sigma_rest  = 0.01
+
+        mu_mass     = 0.175
+        sigma_mass  = 0.10
+
 
 class RobotArm:
     class FrankaArm:
@@ -44,7 +70,18 @@ class RobotArm:
 
 
 class Poses:
-    basic_rot       = np.array([0, 0.3826834 ,0.9238795,0])
+    # Transformation from URDF default to base orientation (Gripper: Facing up, 45° rot -> Facing down, no rotation)
+    base_rot       = np.array([0, 0.3826834, 0.9238795, 0])     
+
+    # Measured offset from wrist of Franka to desired TCP of Yumi Gripper
+    offset          = np.array([0.0, 0.0, 0.02])
+    # Rotation of Franka at time of measurement (45° gripper rot)
+    offset_rot      = np.array([0.9238795, 0, 0, 0.3826834])
+
+    setup_TCP       = np.array([0.6, 0.3, 1.25], dtype=np.float32)
+    lift_TCP        = np.array([0.6, 0.3, 1.25], dtype=np.float32)
+    inter_TCP       = np.array([0.5, 0.0, 1.30], dtype=np.float32)
+    drop_TCP        = np.array([0.6, -0.3, 1.2], dtype=np.float32)
 
 
 class DexNet:

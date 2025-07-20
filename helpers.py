@@ -13,14 +13,14 @@ class Grasp:
 
         self.grasp_array = grasp_array
 
-        self._compute_cam_to_world()
+        self._transform_pos_to_world()
         self._compute_angle_to_quart()
-        self._transform_rot_to_global()
+        self._transform_rot_to_world()
 
     def __repr__(self):
         return f"Grasp(x={self.x}, y={self.y}, z={self.z}, theta={self.theta}, q={self.q})"
     
-    def _compute_cam_to_world(self):
+    def _transform_pos_to_world(self):
         self.x_world = Camera.x_cam + self.x
         self.y_world = Camera.y_cam + self.y
         self.z_world = Camera.z_cam - self.z
@@ -36,18 +36,13 @@ class Grasp:
 
         self.rot = np.array([w, x, y, z])
     
-    def _transform_rot_to_global(self):
-        self.rot_global = quaternion_multiply(self.rot, Poses.basic_rot)
+    def _transform_rot_to_world(self):
+        self.rot_global = quaternion_multiply(self.rot, Poses.base_rot)
 
 
-def offset_target_pos(target_pos_TCP, target_rot, offset_local = np.array([0, 0, 0.3135]), offset_rot = np.array([0.9238795, 0, 0, 0.3826834])):
-    
-    # mat = target_rot
-    # target_rot = np.array([mat[1], mat[2], mat[3], mat[0]], dtype=np.float32)
+def offset_target_pos(target_pos_TCP, target_rot = Poses.base_rot, offset = Poses.offset, offset_rot = Poses.offset_rot):
 
-    # target_orientation_mat = R.from_quat(target_rot).as_matrix()
-
-    offset_local = offset_world_to_local(offset_local, offset_rot)
+    offset_local = offset_world_to_local(offset, offset_rot)
 
     target_rot_mat = quat_to_matrix(target_rot)
     offset_world = target_rot_mat @ offset_local 

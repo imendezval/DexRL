@@ -36,44 +36,20 @@ import isaaclab.sim as sim_utils
 from scene import FrankaScene, FrankaSceneCfg
 
 from helpers import Grasp, offset_target_pos
+from constants import Settings, Poses
 
 
-# ─────────────────────
-# Predetermined Poses
-# ─────────────────────
-# offset_local = np.array([0.0, 0.0, 0.3135])
-# offset_local = np.array([0.0, 0.0, 0.137])
-# offset_local = np.array([0.0, 0.0, 0.035])
-
-offset_local    = np.array([0.0, 0.0, 0.02])
-
-target_rot      = np.array([0, 0.3826834 ,0.9238795,0], dtype=np.float32) # 180 down, 45 z
-TP_setup_TCP    = np.array([0.6, 0.3, 1.25], dtype=np.float32)
-TP_setup_W      = offset_target_pos(TP_setup_TCP, target_rot, offset_local)
-
-TP_pick_TCP     = np.array([0.6, 0.3, 1.05], dtype=np.float32)
-TP_pick_W       = offset_target_pos(TP_pick_TCP, target_rot, offset_local)
-
-TP_lift_TCP     = np.array([0.6, 0.3, 1.25], dtype=np.float32)
-TP_lift_W       = offset_target_pos(TP_lift_TCP, target_rot, offset_local)
-
-TP_inter_TCP    = np.array([0.5, 0.0, 1.3], dtype=np.float32)
-TP_inter_W      = offset_target_pos(TP_inter_TCP, target_rot, offset_local)
-
-TP_drop_TCP     = np.array([0.6, -0.3, 1.2], dtype=np.float32)
-TP_drop_W       = offset_target_pos(TP_drop_TCP, target_rot, offset_local)
+Poses.setup   = offset_target_pos(Poses.setup_TCP)
+Poses.lift    = offset_target_pos(Poses.lift_TCP)
+Poses.inter   = offset_target_pos(Poses.inter_TCP)
+Poses.drop    = offset_target_pos(Poses.drop_TCP)
 
 
-
-
-# ────────────────────
-# Main simulator loop
-# ────────────────────
 def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
     sim_dt = sim.get_physics_dt()
 
-    global TP_pick_W
-    TP_setup2_W = None
+    pose_pick       = None
+    pose_setup2     = None
     target_rot_pick = None
 
     scene.franka_initialize()
@@ -83,7 +59,7 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
     reset_dt = 5000
 
     object_width = 0.015
-    gripper_pose = object_width + 0.005
+    gripper_pose = 0.05
 
     grasps = None
 
@@ -127,8 +103,8 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
         # Picking Sequence
         # ──────────────────
 
-        if step_count == 20:
-            q_target = scene.compute_IK(TP_setup_W, target_rot)
+        if step_count == 100:
+            q_target = scene.compute_IK(Poses.setup, Poses.base_rot)
             scene.request_DexNet_pred()
 
         #print(scene.areq)
@@ -141,55 +117,59 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
 
         gevent.sleep(0)
 
+        if scene.mode == -1:
+            scene.generate_objects(0)
+            scene.mode = 0
+
         ### SETUP
-        if scene.is_target_reached(TP_setup_W, target_rot) and scene.mode == 0 and grasps is not None:
+        if scene.is_target_reached(Poses.setup, Poses.base_rot) and scene.mode == 0 and grasps is not None:
             scene.logger.info("Setup position reached.")
 
-            TP_setup2_W = offset_target_pos(grasps[0].setup_pos, target_rot, offset_local)
+            pose_setup2 = offset_target_pos(grasps[0].setup_pos)
             target_rot_pick = grasps[0].rot_global
             # for grasp in grasps:
             #     print(grasp)
-            q_target = scene.compute_IK(TP_setup2_W, grasps[0].rot_global)
+            q_target = scene.compute_IK(pose_setup2, grasps[0].rot_global)
 
             scene.mode = 1
 
-        if scene.is_target_reached(TP_setup2_W, target_rot_pick) and scene.mode == 1:
+        if scene.is_target_reached(pose_setup2, target_rot_pick) and scene.mode == 1:
             scene.logger.info("Setup2 position reached.")
-            TP_pick_W = offset_target_pos(grasps[0].world_pos, target_rot, offset_local)
-            q_target = scene.compute_IK(TP_pick_W, grasps[0].rot_global)
+            pose_pick = offset_target_pos(grasps[0].world_pos)
+            q_target = scene.compute_IK(pose_pick, grasps[0].rot_global)
 
             scene.mode = 2
 
         ### PICK
-        if scene.is_target_reached(TP_pick_W, target_rot_pick, atol=5e-3):
+        if scene.is_target_reached(pose_pick, target_rot_pick, atol=5e-3):
             scene.mode = 3
             scene.logger.info("Predicted grasp pose reached - closing gripper.")
 
         ### GRIP - Close Gripper
         if scene.mode == 3:
-            gripper_pose = object_width
+            gripper_pose = 0
             gripper_close_vec = torch.tensor([[-1.0,-1.0]],device=scene["yumi_gripper"].data.joint_pos.device).repeat(scene.num_envs, 1) 
             scene["yumi_gripper"].set_joint_velocity_target(gripper_close_vec)
         
         ### GRIP
         if scene.is_obj_clamped() and scene.mode == 3:
             scene.mode = 4
-            q_target = scene.compute_IK(TP_lift_W, target_rot)
+            q_target = scene.compute_IK(Poses.lift, Poses.base_rot)
             scene.logger.info("Object gripped.")
 
         ### LIFT
-        if scene.is_target_reached(TP_lift_W, target_rot, atol=1e-2) and scene.mode == 4:
+        if scene.is_target_reached(Poses.lift, Poses.base_rot, atol=1e-2) and scene.mode == 4:
             scene.mode = 5
-            q_target = scene.compute_IK(TP_inter_W, target_rot)
+            q_target = scene.compute_IK(Poses.inter, Poses.base_rot)
 
         ### INTER
-        if scene.is_target_reached(TP_inter_W, target_rot, atol=1e-2):
-            q_target = scene.compute_IK(TP_drop_W, target_rot)
+        if scene.is_target_reached(Poses.inter, Poses.base_rot, atol=1e-2):
+            q_target = scene.compute_IK(Poses.drop, Poses.base_rot)
 
             scene.mode = 6 
             
         ### DROP
-        if scene.is_target_reached(TP_drop_W, target_rot, atol=1e-2) and scene.mode == 6:
+        if scene.is_target_reached(Poses.drop, Poses.base_rot, atol=1e-2) and scene.mode == 6:
             scene.logger.info("Drop position reached.")
             
             scene.request_DexNet_pred()
@@ -201,6 +181,7 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
             gripper_pose = gripper_def_pos
             gripper_close_vec = torch.tensor([[1.0,1.0]],device=scene["yumi_gripper"].data.joint_pos.device).repeat(scene.num_envs, 1) 
             scene["yumi_gripper"].set_joint_velocity_target(gripper_close_vec)
+            scene.mode = -1
 
         # apply actions to robot
         q_target_yumi =  torch.full_like(scene["yumi_gripper"].data.joint_pos, gripper_pose)
@@ -210,7 +191,14 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
         # print(scene["franka"].data.joint_pos)   
         # print(q_target)
 
-        # print(scene.mode)  
+        # print(scene.mode)
+        # env_ids             = torch.tensor([0, 1], dtype=torch.int32) #constant
+        # mat                 = scene["cube"].root_physx_view.get_material_properties()
+        # mat[env_ids, :, :2] = torch.tensor([0, 0],
+        #                                    dtype=mat.dtype,
+        #                                    device=mat.device)        
+        # scene["cube"].root_physx_view.set_material_properties(mat, env_ids)
+        # print(scene["cube"].root_physx_view.get_material_properties())
 
 
         ### Write to sim + update
@@ -229,7 +217,7 @@ def main():
     # Nice overhead camera
     sim.set_camera_view([3.5, 0.0, 3.2], [0.0, 0.0, 0.5])
 
-    scene_cfg = FrankaSceneCfg(num_envs=1, env_spacing=2.0)
+    scene_cfg = FrankaSceneCfg(num_envs=Settings.num_envs, env_spacing=Settings.env_spacing)
     scene = FrankaScene(scene_cfg)
     scene.setup_post_load()
 
