@@ -17,7 +17,7 @@ class Camera:
     c_y             = 191.75
     intr_matrix     = [f_x, 0, c_x, 0, f_y, c_y, 0, 0, 1]
 
-    x_cam           = 0.6
+    x_cam           = 0.5
     y_cam           = 0.3
     z_cam           = 1.77
     pos             = np.array([x_cam, y_cam, z_cam])
@@ -29,19 +29,21 @@ class Prims:
         path        = "assets/table_instanceable.usd"
         pos         = (0.55, 0.0, 1.05)
         rot         = (0.7071, 0.0, 0.0, 0.7071)
+        scale       = (1.2, 1.0, 1.0)
 
     class KLT_Bin:
         path        = "assets/small_KLT.usd"
-        pos_pick    = (0.6, 0.3, 1.12)
-        pos_place   = (0.6, -0.3, 1.12)
+        pos_pick    = (0.5,  0.3, 1.12)
+        pos_place   = (0.5, -0.3, 1.12)
+        scale       = (1.5, 1.5, 0.5)
 
     class ObjPool:
         path        = "assets/meshes/USD/kit"
         n_obj_pool  = 129
         n_objs_ep   = 12
 
-        pos_x       = 0.5
-        pos_y       = 0.2
+        pos_x       = 0.4
+        pos_y       = 0.25
         x_bins      = 3
         y_bins      = 5
         spacing     = 0.06
@@ -49,7 +51,7 @@ class Prims:
         z_max       = 1.35
 
         mu_static   = 1.20
-        mu_dynamic  = 0.10
+        mu_dynamic  = 0.90
         sigma       = 0.10
 
         mu_rest     = 0.05
@@ -78,10 +80,10 @@ class Poses:
     # Rotation of Franka at time of measurement (45° gripper rot)
     offset_rot      = np.array([0.9238795, 0, 0, 0.3826834])
 
-    setup_TCP       = np.array([0.6, 0.3, 1.25], dtype=np.float32)
-    lift_TCP        = np.array([0.6, 0.3, 1.25], dtype=np.float32)
-    inter_TCP       = np.array([0.5, 0.0, 1.30], dtype=np.float32)
-    drop_TCP        = np.array([0.6, -0.3, 1.2], dtype=np.float32)
+    setup_TCP       = np.array([0.5, 0.3, 1.25], dtype=np.float32)
+    lift_TCP        = np.array([0.5, 0.3, 1.25], dtype=np.float32)
+    inter_TCP       = np.array([0.4, 0.0, 1.30], dtype=np.float32)
+    drop_TCP        = np.array([0.5, -0.3, 1.2], dtype=np.float32)
 
 
 class DexNet:

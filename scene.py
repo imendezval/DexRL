@@ -110,7 +110,8 @@ class FrankaSceneCfg(InteractiveSceneCfg):
     table = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Table",
         spawn=sim_utils.UsdFileCfg(
-            usd_path = os.path.join(dir_, Prims.Table.path)
+            usd_path = os.path.join(dir_, Prims.Table.path),
+            scale=Prims.Table.scale
         ),
         init_state = AssetBaseCfg.InitialStateCfg(pos=Prims.Table.pos, rot=Prims.Table.rot)
     )
@@ -118,7 +119,8 @@ class FrankaSceneCfg(InteractiveSceneCfg):
     KLT_pick = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/KLT_pick",
         spawn=sim_utils.UsdFileCfg(
-            usd_path= os.path.join(dir_, Prims.KLT_Bin.path)
+            usd_path= os.path.join(dir_, Prims.KLT_Bin.path),
+            scale=Prims.KLT_Bin.scale
         ),
         init_state = AssetBaseCfg.InitialStateCfg(pos=Prims.KLT_Bin.pos_pick)
     )
@@ -126,25 +128,26 @@ class FrankaSceneCfg(InteractiveSceneCfg):
     KLT_place = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/KLT_place",
         spawn=sim_utils.UsdFileCfg(
-            usd_path= os.path.join(dir_, Prims.KLT_Bin.path)
+            usd_path= os.path.join(dir_, Prims.KLT_Bin.path),
+            scale=Prims.KLT_Bin.scale
         ),
         init_state = AssetBaseCfg.InitialStateCfg(pos=Prims.KLT_Bin.pos_place)
     )
 
-    cube = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/cube",
-        spawn=sim_utils.MeshCuboidCfg(
-            size=(0.03, 0.03, 0.03),
-            physics_material=sim_utils.materials.RigidBodyMaterialCfg(
-                dynamic_friction=1.0, static_friction=1.0, restitution=0.05 # match with gripper
-            ),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
-            mass_props=sim_utils.MassPropertiesCfg(mass=0.25),
-            collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
-        ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.6, 0.3, 1.15)),
-    )
+    # cube = RigidObjectCfg(
+    #     prim_path="{ENV_REGEX_NS}/cube",
+    #     spawn=sim_utils.MeshCuboidCfg(
+    #         size=(0.03, 0.03, 0.03),
+    #         physics_material=sim_utils.materials.RigidBodyMaterialCfg(
+    #             dynamic_friction=1.0, static_friction=1.0, restitution=0.05 # match with gripper
+    #         ),
+    #         rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
+    #         mass_props=sim_utils.MassPropertiesCfg(mass=0.25),
+    #         collision_props=sim_utils.CollisionPropertiesCfg(),
+    #         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
+    #     ),
+    #     init_state=RigidObjectCfg.InitialStateCfg(pos=(0.6, 0.3, 1.15)),
+    # )
     
     # Object Pool
     # helpers_folder = AssetBaseCfg(
@@ -196,6 +199,7 @@ class FrankaScene(InteractiveScene):
         self._articulation_kinematics_solvers = []
 
         self.mode = -1
+        self.counter = None
 
         self.DexNet_request = None
         self.is_request = False
@@ -279,6 +283,17 @@ class FrankaScene(InteractiveScene):
         return q_target
     
 
+    def is_counter_reached(self, time_step):
+        if self.counter is None:
+            return True
+        
+        if time_step == self.counter:
+            self.counter = None
+            return True 
+        
+        else: return False
+    
+
     def is_target_reached(self, target_pos, target_rot, atol=5e-3):
 
         if target_pos is None or target_rot is None:
@@ -289,10 +304,7 @@ class FrankaScene(InteractiveScene):
 
         is_target_reached = np.allclose(ee_position, target_pos, atol=atol) \
                         and np.allclose(ee_rot, target_rot, atol=atol)
-        # print(ee_rot, target_rot)
-        # print(ee_position, target_pos)
-        # print(np.abs(target_pos-ee_position))
-
+        
         return is_target_reached
 
 
@@ -365,71 +377,53 @@ class FrankaScene(InteractiveScene):
         env_id  = torch.tensor([env_id], device=self.device)
         obj_ids = torch.tensor(obj_list, device=self.device)
 
-        view_ids = obj_pool._env_obj_ids_to_view_ids(env_id, obj_ids)
+        view_ids = obj_pool._env_obj_ids_to_view_ids(env_id, obj_ids).to(torch.uint32).cpu()
 
         # Randomise Domain
-        # self._randomise_friction(N, view, view_ids, device)
+        self._randomise_friction(view, view_ids)
 
-        # self._randomise_mass(N, view, view_ids, device)
+        self._randomise_mass(view, view_ids)
 
         self._randomise_poses(N, env_id, obj_ids)
-
 
         # Visibility???
         ...
 
 
-    def _randomise_friction(self, N: int, view: physx.RigidBodyView, view_ids):
+    def _randomise_friction(self, view: physx.RigidBodyView, view_ids):
 
         S = view.max_shapes
+        N = ObjPool.n_obj_pool * Settings.num_envs # == view.count
 
         mean_fric = torch.tensor([ObjPool.mu_static,
                                   ObjPool.mu_dynamic],
-                                dtype=torch.float32).view(1, 2).expand(N, 2)
+                                  dtype=torch.float32).view(1, 2).expand(N, 2)
         
         std_fric  = torch.full_like(mean_fric, ObjPool.sigma)
+        friction  = torch.normal(mean_fric, std_fric)
 
-        friction = torch.normal(mean_fric, std_fric)
-
-        mean_rest = torch.full((N, 1), ObjPool.mu_rest,  dtype=torch.float32)
-        std_rest  = torch.full((N, 1), ObjPool.sigma_rest, dtype=torch.float32)
-
+        mean_rest   = torch.full((N, 1), ObjPool.mu_rest,  dtype=torch.float32)
+        std_rest    = torch.full((N, 1), ObjPool.sigma_rest, dtype=torch.float32)
         restitution = torch.normal(mean_rest, std_rest)
         # TODO: Static > Dynamic
-
-        # friction = torch.normal(
-        #     mean=torch.tensor([Prims.ObjPool.mu_static, 
-        #                        Prims.ObjPool.mu_dynamic],
-        #                     dtype=torch.float32, device="cpu"),
-        #     std=torch.tensor([Prims.ObjPool.sigma, 
-        #                       Prims.ObjPool.sigma],
-        #                     dtype=torch.float32, device="cpu"),
-        #     size=(N, 2))
-            
-        # restitution = torch.normal(
-        #     mean=torch.tensor([Prims.ObjPool.mu_rest],
-        #                     dtype=torch.float32, device="cpu"),
-        #     std=torch.tensor([Prims.ObjPool.sigma_rest],
-        #                     dtype=torch.float32, device="cpu"),
-        #     size=(N, 1))
         
         properties = torch.cat([friction, restitution], dim=1) # (N, 3)
         properties = properties.unsqueeze(1)                   # (N, 1, 3)
         properties = properties.expand(N, S, 3).clone()        # (N, S, 3)
+        properties = properties.cpu()
 
-        view.set_material_properties(properties, indices=view_ids.to(torch.uint32))
+        view.set_material_properties(properties, indices=view_ids)
 
 
-    def _randomise_mass(self, N: int, view: physx.RigidBodyView, view_ids):
+    def _randomise_mass(self, view: physx.RigidBodyView, view_ids):
 
-        mass = torch.normal(
-            mean=torch.tensor([ObjPool.mu_mass],
-                            dtype=torch.float32, device=self.device),
-            std=torch.tensor([ObjPool.sigma_mass],
-                            dtype=torch.float32, device=self.device),
-            size=(N, 1))
+        N = ObjPool.n_obj_pool * Settings.num_envs # == view.count
 
-        view.set_masses(mass, indices=view_ids.to(torch.uint32))
+        mean_mass   = torch.full((N, 1), ObjPool.mu_rest,  dtype=torch.float32)
+        std_mass    = torch.full((N, 1), ObjPool.sigma_rest, dtype=torch.float32)
+        mass        = torch.normal(mean_mass, std_mass).cpu()
+
+        view.set_masses(mass, indices=view_ids)
 
 
     def _randomise_poses(self, N, env_id, obj_ids):
