@@ -247,7 +247,6 @@ class FrankaScene(InteractiveScene):
         end_effector_name = "right_gripper" #panda_link8 #right_gripper #panda_wrist_end_pt
         for env_path in self.env_prim_paths:
             franka_path = env_path + self._arm_path_loc
-            # print(franka_path)
             franka_single = SingleArticulation(franka_path)
             self._franka_assets.append(franka_single)
 
@@ -331,7 +330,6 @@ class FrankaScene(InteractiveScene):
         for env_id in range(self.num_envs):
             ee_position, ee_rot_mat = self._articulation_kinematics_solvers[env_id].compute_end_effector_pose()
             ee_rot_quat = mat_to_quat(ee_rot_mat)
-            # print(f"ENV_ID:{env_id}: {ee_position}")
 
             ee_pos_list.append(torch.as_tensor(ee_position, device=self.device, dtype=torch.float32))
             ee_rot_list.append(torch.as_tensor(ee_rot_quat, device=self.device, dtype=torch.float32))
@@ -414,8 +412,6 @@ class FrankaScene(InteractiveScene):
     def grasps_to_tensors(self, grasps_DexNet, env_ids):
 
         env_ids = env_ids.cpu().tolist()
-        # print(grasps_DexNet)
-        # print(f"ENV IDS: {env_ids}")
 
         grasps = torch.stack(
             [torch.as_tensor(offset_target_pos(
