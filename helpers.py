@@ -1,3 +1,4 @@
+import torch
 import numpy as np
 from constants import Camera, Poses
 
@@ -26,7 +27,7 @@ class Grasp:
         self.z_world = Camera.z_cam - self.z
 
         self.world_pos = np.array([self.x_world, self.y_world, self.z_world])
-        self.setup_pos = np.array([self.x_world, self.y_world, 1.25])
+        self.setup_pos = np.array([self.x_world, self.y_world, self.z_world + 0.15])
 
     def _compute_angle_to_quart(self):
         w = np.cos(self.theta/2)
@@ -160,3 +161,15 @@ def xyzw_to_wxyz(q):
     """[x y z w]  ->  [w x y z]"""
     x, y, z, w = q
     return np.array([w, x, y, z], dtype=q.dtype)
+
+
+def quat_diff_mag(q, q_ref):
+    """
+    Small-angle metric ‖q − q_ref‖ taking the double-cover into account.
+    Both tensors (*,4) are assumed to be (w,x,y,z) and L2-normalised.
+    """
+    # q ~= -q represents the same rotation ⇒ take the shorter arc
+    return torch.minimum(
+        torch.norm(q - q_ref, dim=-1),
+        torch.norm(q + q_ref, dim=-1),
+    )

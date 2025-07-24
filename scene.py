@@ -9,6 +9,7 @@ import random, math
 
 import isaaclab.sim as sim_utils
 import isaacsim.core.utils.prims as prim_utils
+import isaaclab.utils.math as math_utils
 
 import omni.physics.tensors.impl.api as physx
 
@@ -19,7 +20,7 @@ from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 # CFGs
 from cfg.franka_cfg import FRANKA_PANDA_HIGH_PD_CFG
 from cfg.gripper_cfg import YUMI_CFG
-from isaaclab.assets import AssetBaseCfg, RigidObjectCfg, RigidObjectCollectionCfg#, Articulation
+from isaaclab.assets import AssetBaseCfg, RigidObjectCfg, RigidObjectCollectionCfg, RigidObjectCollection
 from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.sensors import CameraCfg, TiledCameraCfg
 from isaaclab.sensors import ContactSensorCfg
@@ -40,7 +41,7 @@ from isaacsim.robot_motion.motion_generation import interface_config_loader
 from isaacsim.core.prims import SingleArticulation
 
 
-from helpers import Grasp, mat_to_quat
+from helpers import Grasp, mat_to_quat, quat_diff_mag, offset_target_pos
 from constants import Camera, Prims, RobotArm, DexNet, Settings
 
 ObjPool = Prims.ObjPool
@@ -191,20 +192,28 @@ class FrankaScene(InteractiveScene):
 
         self.logger = logging.getLogger(__name__)
 
-        self._arm_path_loc = "/Franka/franka_instanceable"
-        self._gripper_path_loc = "/yumi_gripper/yumi_gripper"
+        self._arm_path_loc      = "/Franka/franka_instanceable"
+        self._gripper_path_loc  = "/yumi_gripper/yumi_gripper"
 
-        self._franka_assets = []
+        self._franka_assets     = []
         self._kinematics_solver = None
         self._articulation_kinematics_solvers = []
 
-        self.mode = -1
-        self.counter = None
+        self.q_target_franka   = None #self.articulations["franka"]._data.default_joint_pos.clone()
+        self.q_target_yumi     = None
+        self.yumi_vel_vec      = None
 
-        self.DexNet_request = None
-        self.is_request = False
+        self.mode    = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        self.counter = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
 
-    
+        self.DexNet_request = [None for _ in range(self.num_envs)]
+
+        self.GRASPS     = torch.zeros(self.num_envs, 3, device=self.device)
+        self.PRE_GRASPS = torch.zeros(self.num_envs, 3, device=self.device)
+        self.GRASPS_ROT = torch.zeros(self.num_envs, 4, device=self.device)
+        self.IS_GRASP  = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+
     def setup_post_load(self):
 
         for env_path in self.env_prim_paths:
@@ -238,6 +247,7 @@ class FrankaScene(InteractiveScene):
         end_effector_name = "right_gripper" #panda_link8 #right_gripper #panda_wrist_end_pt
         for env_path in self.env_prim_paths:
             franka_path = env_path + self._arm_path_loc
+            # print(franka_path)
             franka_single = SingleArticulation(franka_path)
             self._franka_assets.append(franka_single)
 
@@ -246,13 +256,20 @@ class FrankaScene(InteractiveScene):
         
             ###
             jview = articulation_IK_solver._joints_view
-            orig   = jview.get_joint_positions
+            orig  = jview.get_joint_positions
 
-            def _as_numpy(self, *a, **kw):
-                t = orig(*a, **kw)
-                return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t
+            def make_wrapper(orig_fn):
+                def _as_numpy(self, *a, **kw):
+                    t = orig_fn(*a, **kw)
+                    return (
+                        t.detach().cpu().numpy()
+                        if isinstance(t, torch.Tensor) else t
+                    )
+                return _as_numpy
 
-            jview.get_joint_positions = types.MethodType(_as_numpy, jview)
+            jview.get_joint_positions = types.MethodType(
+                make_wrapper(orig), jview
+            )
             ###
     
 
@@ -261,14 +278,21 @@ class FrankaScene(InteractiveScene):
             franka.initialize()
 
 
-    def compute_IK(self, target_pos, target_ori):
+    def compute_IK(self, target_pos, target_rot, env_ids, is_tensor = False):
 
-        q_target = []
-        for IK_solver in self._articulation_kinematics_solvers:
+        q_target = self.q_target_franka.clone()
+
+        for env_id in env_ids.cpu().tolist():
+
             robot_base_translation, robot_base_orientation = np.array([0.0, 0.0, 1.05]), np.array([1.0, 0.0, 0.0, 0.0])
-            self._kinematics_solver.set_robot_base_pose(robot_base_translation, robot_base_orientation) #singlearticulation.get_world_pose()
+            self._kinematics_solver.set_robot_base_pose(robot_base_translation, robot_base_orientation)
 
-            action, ok = IK_solver.compute_inverse_kinematics(target_pos, target_ori)
+            if is_tensor:
+                pos_np = target_pos[env_id].cpu().numpy()
+                rot_np = target_rot[env_id].cpu().numpy()
+                action, _ = self._articulation_kinematics_solvers[env_id].compute_inverse_kinematics(pos_np, rot_np)
+            else:
+                action, _ = self._articulation_kinematics_solvers[env_id].compute_inverse_kinematics(target_pos, target_rot)    
 
             ik_pos = torch.tensor(
                 action.joint_positions,
@@ -276,121 +300,201 @@ class FrankaScene(InteractiveScene):
                 device  = self.articulations["franka"].data.joint_pos.device,
             )
 
-            q_target.append(ik_pos)
-
-        q_target = torch.stack(q_target, dim=0)  
-
+            q_target[env_id] = ik_pos
+        
         return q_target
     
 
-    def is_counter_reached(self, time_step):
-        if self.counter is None:
-            return True
-        
-        if time_step == self.counter:
-            self.counter = None
-            return True 
-        
-        else: return False
+    def is_counter_reached(self, time_step: int):
+
+        t = torch.as_tensor(time_step, device=self.counter.device)
+
+        counter_mask = (self.counter == -1) | (self.counter == t)
+        self.counter[counter_mask] = -1
+
+        return counter_mask
     
 
-    def is_target_reached(self, target_pos, target_rot, atol=5e-3):
+    def is_target_reached(self, target_pos, target_rot, is_tensor = False, atol=5e-3):
 
-        if target_pos is None or target_rot is None:
-            return False
+        
+        if not is_tensor:
+            if target_pos is None or target_rot is None:
+                return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            
+            # (E, 3), (E, 4)
+            target_pos = torch.as_tensor(target_pos, device=self.counter.device, dtype=torch.float32).unsqueeze(0).expand(self.num_envs, -1)
+            target_rot = torch.as_tensor(target_rot, device=self.counter.device, dtype=torch.float32).unsqueeze(0).expand(self.num_envs, -1)
 
-        ee_position, ee_rot_mat = self._articulation_kinematics_solvers[0].compute_end_effector_pose()
-        ee_rot = mat_to_quat(ee_rot_mat)
+        ee_pos_list = []
+        ee_rot_list = []
+        for env_id in range(self.num_envs):
+            ee_position, ee_rot_mat = self._articulation_kinematics_solvers[env_id].compute_end_effector_pose()
+            ee_rot_quat = mat_to_quat(ee_rot_mat)
+            # print(f"ENV_ID:{env_id}: {ee_position}")
 
-        is_target_reached = np.allclose(ee_position, target_pos, atol=atol) \
-                        and np.allclose(ee_rot, target_rot, atol=atol)
+            ee_pos_list.append(torch.as_tensor(ee_position, device=self.device, dtype=torch.float32))
+            ee_rot_list.append(torch.as_tensor(ee_rot_quat, device=self.device, dtype=torch.float32))
+
+        ee_pos = torch.stack(ee_pos_list) # (E, 3)
+        ee_rot = torch.stack(ee_rot_list) # (E, 4)
+
+        pos_err = torch.norm(ee_pos - target_pos, dim=-1)
+        rot_err = quat_diff_mag(ee_rot, target_rot)
+
+        is_target_reached = (pos_err < atol) & (rot_err < atol)
+
+        if is_tensor:
+            is_target_reached = is_target_reached & (self.IS_GRASP == 2)
         
         return is_target_reached
 
 
-    def is_obj_clamped(self):
+    def is_obj_clamped(self, thresh = 0.5):
         
-        force_L = self.sensors["contact_forces_L"].data.net_forces_w.abs().max() # torch.max(scene["contact_forces"].data.net_forces_w).item())
-        force_R = self.sensors["contact_forces_R"].data.net_forces_w.abs().max()
+        force_L = self.sensors["contact_forces_L"].data.net_forces_w
+        force_R = self.sensors["contact_forces_R"].data.net_forces_w
 
-        is_obj_clambed = int(force_L > 0.5 and force_R > 0.5)
+        force_L_mag = torch.linalg.norm(force_L, dim=-1)
+        force_R_mag = torch.linalg.norm(force_R, dim=-1)
 
-        return is_obj_clambed
+        obj_clamped_mask = (force_L_mag > thresh) & (force_R_mag > thresh)    
+
+        return obj_clamped_mask.squeeze(-1)
 
     
-    def request_DexNet_pred(self):
+    def request_DexNet_pred(self, env_ids):
 
         self.logger.info("Requesting grasp predictions from Dex-Net")
 
-        depth_tensor = self.sensors["camera"].data.output["distance_to_image_plane"]
-        depth_np = depth_tensor.cpu().numpy()
-        depth_np = depth_np[0,:,:,:]
+        for env_id in env_ids.cpu().tolist():
 
-        payload = {
-            "shape": list(depth_np.shape),
-            "dtype": str(depth_np.dtype),
-            "data" : base64.b64encode(depth_np.tobytes()).decode()
-        }
+            depth_tensor = self.sensors["camera"].data.output["distance_to_image_plane"]
+            depth_np = depth_tensor.cpu().numpy()
+            depth_np = depth_np[env_id,:,:,:]
 
-        req = grequests.post(DexNet.url, json=payload)
-        self.DexNet_request = grequests.send(req)
+            payload = {
+                "shape": list(depth_np.shape),
+                "dtype": str(depth_np.dtype),
+                "data" : base64.b64encode(depth_np.tobytes()).decode()
+            }
 
-        self.is_request = True
+            req = grequests.post(DexNet.url, json=payload)
+            self.DexNet_request[env_id] = grequests.send(req)
+
+            self.IS_GRASP[env_id] = 1
 
 
-    def get_DexNet_pred(self):
+    def get_DexNet_pred(self, env_ids, grasps_DexNet):
 
-        if self.DexNet_request is None or not self.DexNet_request.ready():
-            return None
+        for env_id in env_ids.cpu().tolist():
+            
+            DexNet_request = self.DexNet_request[env_id]
 
-        reply = self.DexNet_request.value.response.json()
-        grasps_np = (
-            np.frombuffer(bytes.fromhex(reply["data"]),
-                                dtype=reply["dtype"])
-                            .reshape(reply["shape"])
+            if DexNet_request is None or not DexNet_request.ready():
+                continue
+
+            reply = DexNet_request.value.response.json()
+            grasps_np = (
+                np.frombuffer(bytes.fromhex(reply["data"]),
+                                      dtype=reply["dtype"])
+                                   .reshape(reply["shape"])
+            )
+
+            self.DexNet_request[env_id] = None
+            self.IS_GRASP[env_id]       = 2
+            
+            self.logger.info(f"Successfully received grasp predictions from Dex-Net for environment {env_id}")
+
+            grasps_DexNet[env_id] = [Grasp(row) for row in grasps_np]
+
+        return grasps_DexNet
+    
+
+    def grasps_to_tensors(self, grasps_DexNet, env_ids):
+
+        env_ids = env_ids.cpu().tolist()
+        # print(grasps_DexNet)
+        # print(f"ENV IDS: {env_ids}")
+
+        grasps = torch.stack(
+            [torch.as_tensor(offset_target_pos(
+                            grasps_DexNet[env][0].world_pos),
+                            device=self.device,
+                            dtype=torch.float)
+            for env in env_ids]
         )
 
-        self.DexNet_request = None
-        self.is_request = False
-        
-        self.logger.info("Successfully received grasp predictions from Dex-Net")
+        pre_grasps = torch.stack(
+            [torch.as_tensor(offset_target_pos(
+                            grasps_DexNet[env][0].setup_pos),
+                            device=self.device,
+                            dtype=torch.float)
+            for env in env_ids]
+        )
 
-        grasps = [Grasp(row) for row in grasps_np]
+        grasps_rot = torch.stack(
+            [torch.as_tensor(grasps_DexNet[env][0].rot_global,
+                            device=self.device,
+                            dtype=torch.float)
+            for env in env_ids]
+        )
 
-        return grasps
+        return grasps, pre_grasps, grasps_rot
     
     
-    def generate_objects(self, env_id):
+    def generate_objects(self, env_ids):
         # (remove 20 previous)
         ...
 
         N = ObjPool.n_objs_ep
 
-        # Generate list of 20
-        obj_list = sorted(
-                    random.sample(range(0, ObjPool.n_obj_pool), N))
+        # Generate list of objects and view_ids
+        obj_ids = torch.stack(
+            [torch.tensor(sorted(random.sample(range(ObjPool.n_obj_pool), N)),
+                          device=self.device)
+            for _ in range(len(env_ids))]
+        )
+        #env_ids     = torch.tensor(env_ids, device=self.device)
+
+        view_ids    = self._env_obj_ids_to_view_ids_abstract(env_ids, obj_ids).to(torch.uint32)
+
 
         # Get Physx View
         obj_pool    = self.rigid_object_collections["obj_pool"]
         view        = obj_pool.root_physx_view
 
-        env_id  = torch.tensor([env_id], device=self.device)
-        obj_ids = torch.tensor(obj_list, device=self.device)
-
-        view_ids = obj_pool._env_obj_ids_to_view_ids(env_id, obj_ids).to(torch.uint32).cpu()
 
         # Randomise Domain
         self._randomise_friction(view, view_ids)
 
         self._randomise_mass(view, view_ids)
 
-        self._randomise_poses(N, env_id, obj_ids)
+        self._randomise_poses(obj_pool, view, view_ids, env_ids, obj_ids)
 
         # Visibility???
         ...
 
+    
+    def _env_obj_ids_to_view_ids_abstract(
+        self, env_ids: torch.Tensor, object_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        ...
 
-    def _randomise_friction(self, view: physx.RigidBodyView, view_ids):
+        Parameters
+        ----------
+        env_ids: Tensor
+            (E,)
+        object_ids : Tensor
+            (E, N)
+        """
+        view_ids = (object_ids * self.num_envs + env_ids.unsqueeze(1)).flatten()
+
+        return view_ids
+        
+
+    def _randomise_friction(self, view: physx.RigidBodyView, view_ids: torch.tensor):
 
         S = view.max_shapes
         N = ObjPool.n_obj_pool * Settings.num_envs # == view.count
@@ -409,13 +513,13 @@ class FrankaScene(InteractiveScene):
         
         properties = torch.cat([friction, restitution], dim=1) # (N, 3)
         properties = properties.unsqueeze(1)                   # (N, 1, 3)
-        properties = properties.expand(N, S, 3).clone()        # (N, S, 3)
+        properties = properties.expand(N, S, 3).clone()        # (N, S, 3)  
         properties = properties.cpu()
 
-        view.set_material_properties(properties, indices=view_ids)
+        view.set_material_properties(properties, indices=view_ids.cpu())
 
 
-    def _randomise_mass(self, view: physx.RigidBodyView, view_ids):
+    def _randomise_mass(self, view: physx.RigidBodyView, view_ids: torch.tensor):
 
         N = ObjPool.n_obj_pool * Settings.num_envs # == view.count
 
@@ -423,38 +527,46 @@ class FrankaScene(InteractiveScene):
         std_mass    = torch.full((N, 1), ObjPool.sigma_rest, dtype=torch.float32)
         mass        = torch.normal(mean_mass, std_mass).cpu()
 
-        view.set_masses(mass, indices=view_ids)
+        view.set_masses(mass, indices=view_ids.cpu())
 
 
-    def _randomise_poses(self, N, env_id, obj_ids):
+    def _randomise_poses(self, 
+                         obj_pool: RigidObjectCollection, 
+                         view:     physx.RigidBodyView, 
+                         view_ids: torch.tensor, 
+                         env_ids:  torch.tensor, 
+                         obj_ids:  torch.tensor):
 
-        xy = self._sample_discrete_xy_bins(ObjPool.x_bins, 
+        N = ObjPool.n_objs_ep
+
+        xy = torch.stack([
+            self._sample_discrete_xy_bins(ObjPool.x_bins, 
                                            ObjPool.y_bins, 
                                            ObjPool.spacing,
                                            ObjPool.pos_x,
                                            ObjPool.pos_y,
                                            N, env_id)
+            for env_id in env_ids.cpu().tolist()]) # (E, N, 2)
 
-        z  = torch.empty((N, 1), device=self.device).uniform_(ObjPool.z_min, ObjPool.z_max)
+        z  = torch.empty((len(env_ids), N, 1), device=self.device).uniform_(ObjPool.z_min, ObjPool.z_max) # (E, N, 1)
         
-        poses_3d    = torch.cat([xy, z], dim=1)           # (N, 3)
+        poses_3d    = torch.cat([xy, z], dim=2)                         # (E, N, 3)
 
-        quartenions = self._sample_uniform_quaternions(N) # (N, 4)
+        quartenions = self._sample_uniform_quaternions(N, len(env_ids)) # (E, N, 4)
 
-        object_poses = torch.cat([poses_3d, quartenions], dim=1) # (N, 7)
-        object_poses = object_poses.unsqueeze(0)                 # (1, N, 7)
+        object_poses = torch.cat([poses_3d, quartenions], dim=2)        # (E, N, 7)
        
-        self.rigid_object_collections["obj_pool"].write_object_pose_to_sim(object_poses, env_id, obj_ids)
-    
+        self.write_object_pose_to_sim_abstract(obj_pool, view, object_poses, view_ids, env_ids, obj_ids)
+
     
     def _sample_discrete_xy_bins(self,
                                 n_bins_x: int,
                                 n_bins_y: int,
-                                spacing: float,
-                                x0: float,
-                                y0: float,
-                                N: int,
-                                env_id):
+                                spacing:  float,
+                                x0:       float,
+                                y0:       float,
+                                N:        int,
+                                env_id:   int):
         """
         Pick N unique (x,y) bins on a regular grid.
 
@@ -485,23 +597,44 @@ class FrankaScene(InteractiveScene):
         return xy
 
 
-    def _sample_uniform_quaternions(self, N: int):
+    def _sample_uniform_quaternions(self, N: int, E: int):
         """
         Marsaglia 1972 method — uniform over SO(3).
 
         Returns
         -------
-        q : torch.Tensor, shape (N, 4)  (w, x, y, z)
+        q : torch.Tensor, shape (E, N, 4)  (w, x, y, z)
         """
-        u1, u2, u3 = torch.rand(3, N, device=self.device)
+        u1, u2, u3 = torch.rand(3, E, N, device=self.device)
 
-        q = torch.zeros((N, 4), device=self.device)
-        q[:, 0] = torch.sqrt(1.0 - u1) * torch.sin(2 * math.pi * u2)   # x
-        q[:, 1] = torch.sqrt(1.0 - u1) * torch.cos(2 * math.pi * u2)   # y
-        q[:, 2] = torch.sqrt(     u1) * torch.sin(2 * math.pi * u3)    # z
-        q[:, 3] = torch.sqrt(     u1) * torch.cos(2 * math.pi * u3)    # w
-        return q[:, (3, 0, 1, 2)]
+        q = torch.zeros((E, N, 4), device=self.device)
+        q[..., 0] = torch.sqrt(1.0 - u1) * torch.sin(2 * math.pi * u2)   # x
+        q[..., 1] = torch.sqrt(1.0 - u1) * torch.cos(2 * math.pi * u2)   # y
+        q[..., 2] = torch.sqrt(      u1) * torch.sin(2 * math.pi * u3)   # z
+        q[..., 3] = torch.sqrt(      u1) * torch.cos(2 * math.pi * u3)   # w
+        return q[..., (3, 0, 1, 2)]
     
+
+    def write_object_pose_to_sim_abstract(
+        self,
+        obj_pool: RigidObjectCollection,
+        view: physx.RigidBodyView,
+        object_pose: torch.Tensor,
+        view_ids,
+        env_ids: torch.Tensor | None = None,
+        object_ids: slice | torch.Tensor | None = None,
+    ):
+
+        # set into internal buffers
+        obj_pool._data.object_state_w[env_ids[:, None], object_ids, :7] = object_pose.clone() ######
+        
+        # convert the quaternion from wxyz to xyzw
+        poses_xyzw = obj_pool._data.object_state_w[..., :7].clone()
+        poses_xyzw[..., 3:] = math_utils.convert_quat(poses_xyzw[..., 3:], to="xyzw")
+
+        # set into simulation
+        view.set_transforms(obj_pool.reshape_data_to_view(poses_xyzw), indices=view_ids)
+
 
     def move_obj(self, env_id):
 

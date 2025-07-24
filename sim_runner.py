@@ -42,23 +42,27 @@ Poses.lift    = offset_target_pos(Poses.lift_TCP)
 Poses.inter   = offset_target_pos(Poses.inter_TCP)
 Poses.drop    = offset_target_pos(Poses.drop_TCP)
 
-
+# TODO: Scale to work independently with different environments
+# TODO: Check Franka Arm reaches and rotations
+# TODO: Detect if object has been lifted (/bin moved?)
+# TODO: Update SegMask
 def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
     sim_dt = sim.get_physics_dt()
 
-    GRASP       = None
-    GRASP_ROT   = None
-    PRE_GRASP   = None
-
     scene.franka_initialize()
-    q_target = scene["franka"].data.default_joint_pos
 
-    step_count = 0
+    scene.q_target_franka = scene["franka"].data.default_joint_pos.clone()
 
     gripper_pose = 0.05
+    scene.q_target_yumi = torch.full_like(scene["yumi_gripper"].data.joint_pos, gripper_pose)
+    scene.yumi_vel_vec  = torch.tensor([[0.0, 0.0]],
+                                        device=scene["yumi_gripper"].data.joint_pos.device
+                                        ).repeat(scene.num_envs, 1)
 
-    grasps = None
 
+    grasps_DexNet = [None for _ in range(scene.num_envs)]
+
+    step_count = 0
     while simulation_app.is_running():
         
         if step_count == 0:
@@ -99,7 +103,7 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
         # Picking Sequence
         # ──────────────────
 
-        # -1    regenerate, cstart ounter
+        # -1    regenerate, start ounter
         # 0     counter - request, SETUP IK
         # 1     PRE_GRASP IK
         # 2     GRASP IK
@@ -112,115 +116,159 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
         # 9     Restart cycle
 
 
-        if scene.is_request:
-            grasps = scene.get_DexNet_pred()
+        # Tensor:
+        # is_request, counter, mode
+        # Functions:
+        # request_DexNet_pred, compute_IK, is_target_reached, is_obj_clamped, is_counter_reached, generate_objects
+        #
+
+        DEXNET_MASK = (scene.IS_GRASP == 1)
+        if DEXNET_MASK.any():
+            env_ids = DEXNET_MASK.nonzero(as_tuple=False).flatten()
+
+            grasps_DexNet = scene.get_DexNet_pred(env_ids, grasps_DexNet)
 
         gevent.sleep(0)
 
-        if scene.mode == -1:
-            scene.generate_objects(0)
-            scene.counter = step_count + 100
+        REGENERATE_MASK = (scene.mode == -1)
+        if REGENERATE_MASK.any():
+            env_ids = REGENERATE_MASK.nonzero(as_tuple=False).flatten()
 
-            scene.mode = 0
+            scene.logger.info(f"Object Generator started in {env_ids.cpu().tolist()}")
 
-        ### SETUP
-        if scene.mode == 0 and scene.is_counter_reached(step_count):
+            scene.generate_objects(env_ids)
+            scene.counter[REGENERATE_MASK] = step_count + 100
 
-            q_target = scene.compute_IK(Poses.setup, Poses.base_rot)
-            scene.request_DexNet_pred()
+            scene.mode[REGENERATE_MASK] = 0
 
-            scene.mode = 1
 
-        ### PRE-GRASP
-        if scene.mode == 1 and scene.is_target_reached(Poses.setup, Poses.base_rot) and grasps is not None:
-            scene.logger.info("SETUP position reached.")
+        SETUP_MASK = (scene.mode == 0) & scene.is_counter_reached(step_count)
+        if SETUP_MASK.any():
+            env_ids = SETUP_MASK.nonzero(as_tuple=False).flatten()
 
-            GRASP     = offset_target_pos(grasps[0].world_pos)
-            PRE_GRASP = offset_target_pos(grasps[0].setup_pos)
-            GRASP_ROT = grasps[0].rot_global
-            grasps    = None
+            scene.request_DexNet_pred(env_ids)
+            scene.q_target_franka = scene.compute_IK(Poses.setup, Poses.base_rot, env_ids)
 
-            q_target = scene.compute_IK(PRE_GRASP, GRASP_ROT)
+            scene.mode[SETUP_MASK] = 1
 
-            scene.mode = 2
 
-        ### GRASP
-        if scene.mode == 2 and scene.is_target_reached(PRE_GRASP, GRASP_ROT):
-            scene.logger.info("PRE-GRASP position reached.")
+        PRE_GRASP_MASK = ((scene.mode == 1) &
+                          scene.is_target_reached(Poses.setup, Poses.base_rot) &
+                          (scene.IS_GRASP == 2))
+        if PRE_GRASP_MASK.any():
+            env_ids = PRE_GRASP_MASK.nonzero(as_tuple=False).flatten()
 
-            q_target = scene.compute_IK(GRASP, GRASP_ROT)
+            scene.logger.info(f"SETUP position reached in {env_ids.cpu().tolist()}.")
+            
+            grasps, pre_grasps, grasps_rot = scene.grasps_to_tensors(grasps_DexNet, env_ids)
 
-            scene.mode = 3
+            scene.GRASPS[PRE_GRASP_MASK]     = grasps
+            scene.PRE_GRASPS[PRE_GRASP_MASK] = pre_grasps
+            scene.GRASPS_ROT[PRE_GRASP_MASK] = grasps_rot
+
+            scene.q_target_franka = scene.compute_IK(scene.PRE_GRASPS, scene.GRASPS_ROT, env_ids, is_tensor=True)
+
+            scene.mode[PRE_GRASP_MASK] = 2
+
+
+        GRASP_MASK = (scene.mode == 2) & scene.is_target_reached(scene.PRE_GRASPS, scene.GRASPS_ROT, is_tensor=True)
+        if GRASP_MASK.any():
+            env_ids = GRASP_MASK.nonzero(as_tuple=False).flatten()
+
+            scene.logger.info(f"PRE-GRASP position reached in {env_ids.cpu().tolist()}.")
+
+            scene.q_target_franka = scene.compute_IK(scene.GRASPS, scene.GRASPS_ROT, env_ids, is_tensor=True)
+
+            scene.mode[GRASP_MASK] = 3
 
         ### Close Gripper
-        if scene.mode == 3 and scene.is_target_reached(GRASP, GRASP_ROT, atol=5e-3):
-            scene.logger.info("GRASP position reached - Closing Gripper.")
+        CLOSE_GRIPPER_MASK =  (scene.mode == 3) & scene.is_target_reached(scene.GRASPS, scene.GRASPS_ROT, is_tensor=True, atol=5e-3)
+        if CLOSE_GRIPPER_MASK.any():
+            env_ids = CLOSE_GRIPPER_MASK.nonzero(as_tuple=False).flatten()
 
-            gripper_pose = 0
+            scene.logger.info(f"GRASP position reached - Closing Gripper in {env_ids.cpu().tolist()}.")
 
-            gripper_close_vec = torch.tensor([[-1.0,-1.0]],
-                                             device=scene["yumi_gripper"].data.joint_pos.device
-                                             ).repeat(scene.num_envs, 1)
-            scene["yumi_gripper"].set_joint_velocity_target(gripper_close_vec)
+            scene.q_target_yumi[CLOSE_GRIPPER_MASK] = 0
+            scene.yumi_vel_vec[CLOSE_GRIPPER_MASK]  = -1 # broadcasted
 
-            scene.mode = 4
+            scene.mode[CLOSE_GRIPPER_MASK] = 4
         
-        ### LIFT
-        if scene.mode == 4 and scene.is_obj_clamped():
-            scene.logger.info("Object gripped.")
 
-            q_target = scene.compute_IK(PRE_GRASP, GRASP_ROT)
+        LIFT_MASK = (scene.mode == 4) & scene.is_obj_clamped()
+        if LIFT_MASK.any():
+            env_ids = LIFT_MASK.nonzero(as_tuple=False).flatten()
 
-            scene.mode = 5
+            scene.logger.info(f"Object gripped in {env_ids.cpu().tolist()}.")
 
-        ### INTER
-        if scene.mode == 5 and scene.is_target_reached(PRE_GRASP, GRASP_ROT, atol=1e-2):
+            scene.q_target_franka = scene.compute_IK(scene.PRE_GRASPS, scene.GRASPS_ROT, env_ids, is_tensor=True)
+
+            scene.mode[LIFT_MASK] = 5
+
+
+        INTER_MASK = (scene.mode == 5) & scene.is_target_reached(scene.PRE_GRASPS, scene.GRASPS_ROT, is_tensor=True, atol=1e-2)
+        if INTER_MASK.any():
+            env_ids = INTER_MASK.nonzero(as_tuple=False).flatten()
+        
             scene.logger.info("LIFT position reached.")
 
-            q_target = scene.compute_IK(Poses.inter, Poses.base_rot)
+            scene.q_target_franka = scene.compute_IK(Poses.inter, Poses.base_rot, env_ids)
 
-            scene.mode = 6
+            scene.mode[INTER_MASK] = 6
 
-        ### DROP
-        if scene.mode == 6 and scene.is_target_reached(Poses.inter, Poses.base_rot, atol=1e-2):
+
+        DROP_MASK = (scene.mode == 6) & scene.is_target_reached(Poses.inter, Poses.base_rot, atol=1e-2)
+        if DROP_MASK.any():
+            env_ids = DROP_MASK.nonzero(as_tuple=False).flatten()
+            
             scene.logger.info("INTER position reached.")
 
-            q_target = scene.compute_IK(Poses.drop, Poses.base_rot)
+            scene.q_target_franka = scene.compute_IK(Poses.drop, Poses.base_rot, env_ids)
 
-            scene.mode = 7
+            scene.mode[DROP_MASK] = 7
             
-        ### Open Gripper
-        if scene.mode == 7 and scene.is_target_reached(Poses.drop, Poses.base_rot, atol=1e-2):
+
+        OPEN_GRIPPER_MASK = (scene.mode == 7) & scene.is_target_reached(Poses.drop, Poses.base_rot, atol=1e-2)
+        if OPEN_GRIPPER_MASK.any():
+            env_ids = OPEN_GRIPPER_MASK.nonzero(as_tuple=False).flatten()
+
             scene.logger.info("DROP position reached - Opening Gripper.")
 
-            gripper_pose = gripper_def_pos
-            gripper_close_vec = torch.tensor([[1.0,1.0]],
-                                             device=scene["yumi_gripper"].data.joint_pos.device
-                                             ).repeat(scene.num_envs, 1) 
-            scene["yumi_gripper"].set_joint_velocity_target(gripper_close_vec)
+            scene.q_target_yumi[OPEN_GRIPPER_MASK] = 0.05
+            scene.yumi_vel_vec[OPEN_GRIPPER_MASK]  = 1
 
-            scene.counter = step_count + 10
+            scene.counter[OPEN_GRIPPER_MASK] = step_count + 50
 
-            scene.mode = 8
+            scene.mode[OPEN_GRIPPER_MASK] = 8
 
-        ### INTER
-        if scene.mode == 8 and scene.is_counter_reached(step_count):
+        
+        INTER_MASK2 = (scene.mode == 8) & scene.is_counter_reached(step_count)
+        if INTER_MASK2.any():
+            env_ids = INTER_MASK2.nonzero(as_tuple=False).flatten()
+
             scene.logger.info("Object Dropped.")
             
-            q_target = scene.compute_IK(Poses.inter, Poses.base_rot)
+            scene.q_target_franka = scene.compute_IK(Poses.inter, Poses.base_rot, env_ids)
 
-            scene.mode = 9
+            scene.mode[INTER_MASK2] = 9
 
-        ### Restart Sequence
-        if scene.mode == 9 and scene.is_target_reached(Poses.inter, Poses.base_rot):
+
+        RESTART_MASK = (scene.mode == 9) & scene.is_target_reached(Poses.inter, Poses.base_rot)
+        if RESTART_MASK.any():
+            env_ids = RESTART_MASK.nonzero(as_tuple=False).flatten()
+
             scene.logger.info("Restarting Picking Sequence.")
 
-            scene.mode = 0
+            scene.mode[RESTART_MASK]       = 0 ##################### 
+            scene.PRE_GRASPS[RESTART_MASK] = 0
+            scene.GRASPS_ROT[RESTART_MASK] = 0
+            scene.IS_GRASP[RESTART_MASK]   = 0
+            scene.GRASPS[RESTART_MASK]     = 0
 
         # apply actions to gripper
-        q_target_yumi =  torch.full_like(scene["yumi_gripper"].data.joint_pos, gripper_pose)
-        scene["yumi_gripper"].set_joint_position_target(q_target_yumi)       
-        scene["franka"].set_joint_position_target(q_target)
+        #q_target_yumi =  torch.full_like(scene["yumi_gripper"].data.joint_pos, gripper_pose)
+        scene["yumi_gripper"].set_joint_velocity_target(scene.yumi_vel_vec)
+        scene["yumi_gripper"].set_joint_position_target(scene.q_target_yumi)       
+        scene["franka"].set_joint_position_target(scene.q_target_franka)
 
         # print(scene.mode)
 

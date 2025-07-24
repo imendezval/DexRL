@@ -43,7 +43,7 @@ class Prims:
         n_objs_ep   = 12
 
         pos_x       = 0.4
-        pos_y       = 0.25
+        pos_y       = 0.2
         x_bins      = 3
         y_bins      = 5
         spacing     = 0.06
