@@ -50,6 +50,11 @@ ObjPool = Prims.ObjPool
 
 dir_ = os.path.dirname(os.path.realpath(__file__))
 
+OBJ_PATTERNS = [
+    f"{{ENV_REGEX_NS}}/obj_{i}"
+    for i in range(ObjPool.n_obj_pool)      # 0 … 128
+]
+
 
 # @configclass
 # class XformCfg(SpawnerCfg):
@@ -181,8 +186,10 @@ class FrankaSceneCfg(InteractiveSceneCfg):
     offset=CameraCfg.OffsetCfg(pos=tuple(Camera.pos), rot=tuple(Camera.rot), convention="ros"),
     )
 
-    contact_forces_L = ContactSensorCfg(prim_path = "{ENV_REGEX_NS}/yumi_gripper/yumi_gripper/gripper_finger_l")
-    contact_forces_R = ContactSensorCfg(prim_path = "{ENV_REGEX_NS}/yumi_gripper/yumi_gripper/gripper_finger_r")
+    contact_forces_L = ContactSensorCfg(prim_path = "{ENV_REGEX_NS}/yumi_gripper/yumi_gripper/gripper_finger_l", filter_prim_paths_expr = OBJ_PATTERNS)
+    contact_forces_R = ContactSensorCfg(prim_path = "{ENV_REGEX_NS}/yumi_gripper/yumi_gripper/gripper_finger_r", filter_prim_paths_expr = OBJ_PATTERNS)
+    # compute_first_contact
+    # compute_first_air
 
 
 
@@ -203,7 +210,7 @@ class FrankaScene(InteractiveScene):
         self.q_target_yumi     = None
         self.yumi_vel_vec      = None
 
-        self.mode    = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        self.mode    = torch.full((self.num_envs,), -2, dtype=torch.long, device=self.device)
         self.counter = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
 
         self.DexNet_request = [None for _ in range(self.num_envs)]
@@ -211,7 +218,9 @@ class FrankaScene(InteractiveScene):
         self.GRASPS     = torch.zeros(self.num_envs, 3, device=self.device)
         self.PRE_GRASPS = torch.zeros(self.num_envs, 3, device=self.device)
         self.GRASPS_ROT = torch.zeros(self.num_envs, 4, device=self.device)
-        self.IS_GRASP  = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.IS_GRASP   = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.gripped_obj_ids    = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+
 
 
     def setup_post_load(self):
@@ -352,13 +361,24 @@ class FrankaScene(InteractiveScene):
         
         force_L = self.sensors["contact_forces_L"].data.net_forces_w
         force_R = self.sensors["contact_forces_R"].data.net_forces_w
-
+#
         force_L_mag = torch.linalg.norm(force_L, dim=-1)
         force_R_mag = torch.linalg.norm(force_R, dim=-1)
 
         obj_clamped_mask = (force_L_mag > thresh) & (force_R_mag > thresh)    
 
         return obj_clamped_mask.squeeze(-1)
+    
+    
+    def identify_obj_ids(self, env_ids):
+        force_tensor = self.sensors["contact_forces_L"].data.force_matrix_w # (E, 1, N, 3)
+        forces = force_tensor.squeeze(1) # (E, N, 3)
+        mag = torch.linalg.norm(forces, dim=-1) # (E, N)
+        print(mag[env_ids, :].max())
+
+        obj_idx = mag[env_ids, :].argmax(dim=-1)  
+
+        self.gripped_obj_ids[env_ids] = obj_idx
 
     
     def request_DexNet_pred(self, env_ids):
@@ -437,36 +457,45 @@ class FrankaScene(InteractiveScene):
         )
 
         return grasps, pre_grasps, grasps_rot
-    
-    
+
+
+class ObjectGenerator(object):
+    def __init__(self, obj_pool: RigidObjectCollection, num_envs, env_origins, device):
+
+        self.obj_pool = obj_pool
+        self.view     = obj_pool.root_physx_view 
+        self.org_pos  = self.view.get_transforms().clone()
+
+        self.device      = device
+        self.num_envs    = num_envs
+        self.env_origins = env_origins
+
+        self.obj_ids          = torch.full((self.num_envs, ObjPool.n_objs_ep), -1, dtype=torch.long, device=self.device)
+        self.is_obj_id_in_bin = torch.ones(self.num_envs, ObjPool.n_objs_ep, dtype=torch.bool, device=self.device)
+
+
     def generate_objects(self, env_ids):
-        # (remove 20 previous)
-        ...
 
-        N = ObjPool.n_objs_ep
+        # Remove previous objects
+        if (self.obj_ids[env_ids] != -1).all():
+            self.restart_pool(env_ids)
 
-        # Generate list of objects and view_ids
+        # Generate random list of objects and view_ids
         obj_ids = torch.stack(
-            [torch.tensor(sorted(random.sample(range(ObjPool.n_obj_pool), N)),
+            [torch.tensor(sorted(random.sample(range(ObjPool.n_obj_pool), ObjPool.n_objs_ep)),
                           device=self.device)
             for _ in range(len(env_ids))]
         )
-        #env_ids     = torch.tensor(env_ids, device=self.device)
+        self.obj_ids[env_ids] = obj_ids
 
-        view_ids    = self._env_obj_ids_to_view_ids_abstract(env_ids, obj_ids).to(torch.uint32)
-
-
-        # Get Physx View
-        obj_pool    = self.rigid_object_collections["obj_pool"]
-        view        = obj_pool.root_physx_view
-
+        view_ids = self._env_obj_ids_to_view_ids_abstract(env_ids, obj_ids).to(torch.uint32)
 
         # Randomise Domain
-        self._randomise_friction(view, view_ids)
+        self._randomise_friction(view_ids)
 
-        self._randomise_mass(view, view_ids)
+        self._randomise_mass(view_ids)
 
-        self._randomise_poses(obj_pool, view, view_ids, env_ids, obj_ids)
+        self._randomise_poses(view_ids, env_ids, obj_ids)
 
         # Visibility???
         ...
@@ -488,11 +517,45 @@ class FrankaScene(InteractiveScene):
         view_ids = (object_ids * self.num_envs + env_ids.unsqueeze(1)).flatten()
 
         return view_ids
-        
+    
 
-    def _randomise_friction(self, view: physx.RigidBodyView, view_ids: torch.tensor):
+    def restart_pool(self, env_ids):
+        view_ids = self._env_obj_ids_to_view_ids_abstract(env_ids, self.obj_ids[env_ids]).to(torch.uint32)
 
-        S = view.max_shapes
+        object_poses = self.org_pos[view_ids.long()]
+        self.write_object_pose_to_sim_abstract(object_poses.view(len(env_ids), ObjPool.n_objs_ep, 7), view_ids, env_ids, self.obj_ids[env_ids])
+
+    
+    def clean_pool(self, env_ids):
+
+        obj_pool_poses = self.view.get_transforms()
+
+        obj_ids   = self.obj_ids[env_ids]
+        view_ids_bin  = self._env_obj_ids_to_view_ids_abstract(env_ids, obj_ids).to(torch.uint32)
+        obj_bin_poses = obj_pool_poses[view_ids_bin.long()].view(len(env_ids), ObjPool.n_objs_ep, 7)
+
+        obj_bin_poses_rel = obj_bin_poses[..., :2] - self.env_origins[:, :2].unsqueeze(1) # (E, N, 2) - # (E, 1, 2)
+
+        mask_out = ( # (E, N)
+            (obj_bin_poses_rel[..., 0] <  ObjPool.pos_x)           |   
+            (obj_bin_poses_rel[..., 0] > (ObjPool.pos_x + 0.27))   |
+            (obj_bin_poses_rel[..., 1] <  ObjPool.pos_y)           |
+            (obj_bin_poses_rel[..., 1] > (ObjPool.pos_y + 0.39))
+        )
+        obj_ids_outside_bin = obj_ids[mask_out]
+
+
+        view_ids_bin_out     = self._env_obj_ids_to_view_ids_abstract(env_ids, obj_ids_outside_bin).to(torch.uint32)
+        object_poses_bin_out = self.org_pos[view_ids_bin_out.long()]
+
+        self.write_object_pose_to_sim_abstract(object_poses_bin_out.view(len(env_ids), -1, 7), view_ids_bin_out, env_ids, obj_ids_outside_bin)
+
+        self.is_obj_id_in_bin[env_ids] = ~mask_out
+
+
+    def _randomise_friction(self, view_ids: torch.tensor):
+
+        S = self.view.max_shapes
         N = ObjPool.n_obj_pool * Settings.num_envs # == view.count
 
         mean_fric = torch.tensor([ObjPool.mu_static,
@@ -512,10 +575,10 @@ class FrankaScene(InteractiveScene):
         properties = properties.expand(N, S, 3).clone()        # (N, S, 3)  
         properties = properties.cpu()
 
-        view.set_material_properties(properties, indices=view_ids.cpu())
+        self.view.set_material_properties(properties, indices=view_ids.cpu())
 
 
-    def _randomise_mass(self, view: physx.RigidBodyView, view_ids: torch.tensor):
+    def _randomise_mass(self, view_ids: torch.tensor):
 
         N = ObjPool.n_obj_pool * Settings.num_envs # == view.count
 
@@ -523,12 +586,10 @@ class FrankaScene(InteractiveScene):
         std_mass    = torch.full((N, 1), ObjPool.sigma_rest, dtype=torch.float32)
         mass        = torch.normal(mean_mass, std_mass).cpu()
 
-        view.set_masses(mass, indices=view_ids.cpu())
+        self.view.set_masses(mass, indices=view_ids.cpu())
 
 
     def _randomise_poses(self, 
-                         obj_pool: RigidObjectCollection, 
-                         view:     physx.RigidBodyView, 
                          view_ids: torch.tensor, 
                          env_ids:  torch.tensor, 
                          obj_ids:  torch.tensor):
@@ -537,12 +598,12 @@ class FrankaScene(InteractiveScene):
 
         xy = torch.stack([
             self._sample_discrete_xy_bins(ObjPool.x_bins, 
-                                           ObjPool.y_bins, 
-                                           ObjPool.spacing,
-                                           ObjPool.pos_x,
-                                           ObjPool.pos_y,
-                                           N, env_id)
-            for env_id in env_ids.cpu().tolist()]) # (E, N, 2)
+                                            ObjPool.y_bins, 
+                                            ObjPool.spacing,
+                                            ObjPool.pos_x,
+                                            ObjPool.pos_y,
+                                            N, env_id)
+            for env_id in env_ids.cpu().tolist()]) # (E, N, 2)2
 
         z  = torch.empty((len(env_ids), N, 1), device=self.device).uniform_(ObjPool.z_min, ObjPool.z_max) # (E, N, 1)
         
@@ -552,7 +613,7 @@ class FrankaScene(InteractiveScene):
 
         object_poses = torch.cat([poses_3d, quartenions], dim=2)        # (E, N, 7)
        
-        self.write_object_pose_to_sim_abstract(obj_pool, view, object_poses, view_ids, env_ids, obj_ids)
+        self.write_object_pose_to_sim_abstract(object_poses, view_ids, env_ids, obj_ids)
 
     
     def _sample_discrete_xy_bins(self,
@@ -613,8 +674,6 @@ class FrankaScene(InteractiveScene):
 
     def write_object_pose_to_sim_abstract(
         self,
-        obj_pool: RigidObjectCollection,
-        view: physx.RigidBodyView,
         object_pose: torch.Tensor,
         view_ids,
         env_ids: torch.Tensor | None = None,
@@ -622,22 +681,11 @@ class FrankaScene(InteractiveScene):
     ):
 
         # set into internal buffers
-        obj_pool._data.object_state_w[env_ids[:, None], object_ids, :7] = object_pose.clone() ######
+        self.obj_pool._data.object_state_w[env_ids[:, None], object_ids, :7] = object_pose.clone() ######
         
         # convert the quaternion from wxyz to xyzw
-        poses_xyzw = obj_pool._data.object_state_w[..., :7].clone()
+        poses_xyzw = self.obj_pool._data.object_state_w[..., :7].clone()
         poses_xyzw[..., 3:] = math_utils.convert_quat(poses_xyzw[..., 3:], to="xyzw")
 
         # set into simulation
-        view.set_transforms(obj_pool.reshape_data_to_view(poses_xyzw), indices=view_ids)
-
-
-    def move_obj(self, env_id):
-
-        rigid_obj = self.rigid_objects["cube"].root_physx_view
-        env_id             = torch.tensor([env_id], dtype=torch.uint32)  # env_idx.to(torch.uint32)
-        mat                = rigid_obj.get_material_properties()
-        mat[env_id, :, :2] = torch.tensor([0, 0],
-                                           dtype=mat.dtype,
-                                           device=mat.device)    
-        rigid_obj.set_material_properties(mat, env_id)
+        self.view.set_transforms(self.obj_pool.reshape_data_to_view(poses_xyzw), indices=view_ids)

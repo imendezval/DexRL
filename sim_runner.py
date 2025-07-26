@@ -31,7 +31,7 @@ import torch
 import gevent
 
 import isaaclab.sim as sim_utils
-from scene import FrankaScene, FrankaSceneCfg
+from scene import FrankaScene, FrankaSceneCfg, ObjectGenerator
 
 from helpers import Grasp, offset_target_pos
 from constants import Settings, Poses
@@ -42,7 +42,6 @@ Poses.lift    = offset_target_pos(Poses.lift_TCP)
 Poses.inter   = offset_target_pos(Poses.inter_TCP)
 Poses.drop    = offset_target_pos(Poses.drop_TCP)
 
-# TODO: Scale to work independently with different environments
 # TODO: Check Franka Arm reaches and rotations
 # TODO: Detect if object has been lifted (/bin moved?)
 # TODO: Update SegMask
@@ -58,7 +57,11 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
     scene.yumi_vel_vec  = torch.tensor([[0.0, 0.0]],
                                         device=scene["yumi_gripper"].data.joint_pos.device
                                         ).repeat(scene.num_envs, 1)
-
+    
+    ObjGen = ObjectGenerator(scene["obj_pool"], 
+                                      num_envs = scene.num_envs,
+                                      env_origins = scene.env_origins,
+                                      device = scene.device)
 
     grasps_DexNet = [None for _ in range(scene.num_envs)]
 
@@ -94,7 +97,7 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
                scene["yumi_gripper"].data.default_joint_vel,
             ) 
             scene["yumi_gripper"].write_joint_state_to_sim(joint_pos_gripper, joint_vel_gripper)
-            gripper_def_pos = joint_pos_gripper[0][0].item()
+            #gripper_def_pos = joint_pos_gripper[0][0].item()
 
             scene.reset()
             scene.logger.info("Franka Reset.")
@@ -103,24 +106,19 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
         # Picking Sequence
         # ──────────────────
 
-        # -1    regenerate, start ounter
-        # 0     counter - request, SETUP IK
-        # 1     PRE_GRASP IK
-        # 2     GRASP IK
+        # -2    regenerate
+        # -1    clean
+        # 0     SETUP, Request
+        # 1     PRE_GRASP
+        # 2     GRASP
         # 3     Close Gripper
-        # 4     LIFT  IK
-        # 5     INTER IK
-        # 6     DROP  IK
+        # 4     LIFT
+        # 5     INTER, identify obj_ids
+        # 6     DROP
         # 7     Open Gripper
-        # 8     INTER  IK
+        # 8     INTER
         # 9     Restart cycle
 
-
-        # Tensor:
-        # is_request, counter, mode
-        # Functions:
-        # request_DexNet_pred, compute_IK, is_target_reached, is_obj_clamped, is_counter_reached, generate_objects
-        #
 
         DEXNET_MASK = (scene.IS_GRASP == 1)
         if DEXNET_MASK.any():
@@ -130,16 +128,27 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
 
         gevent.sleep(0)
 
-        REGENERATE_MASK = (scene.mode == -1)
+
+        REGENERATE_MASK = (scene.mode == -2)
         if REGENERATE_MASK.any():
             env_ids = REGENERATE_MASK.nonzero(as_tuple=False).flatten()
 
             scene.logger.info(f"Object Generator started in {env_ids.cpu().tolist()}")
 
-            scene.generate_objects(env_ids)
+            ObjGen.generate_objects(env_ids)
             scene.counter[REGENERATE_MASK] = step_count + 100
 
-            scene.mode[REGENERATE_MASK] = 0
+            scene.mode[REGENERATE_MASK] = -1
+
+        
+        CLEAN_MASK = (scene.mode == -1) & scene.is_counter_reached(step_count)
+        if CLEAN_MASK.any():
+            env_ids = CLEAN_MASK.nonzero(as_tuple=False).flatten()
+
+            ObjGen.clean_pool(env_ids)
+            scene.counter[CLEAN_MASK] = step_count + 10
+
+            scene.mode[env_ids] = 0
 
 
         SETUP_MASK = (scene.mode == 0) & scene.is_counter_reached(step_count)
@@ -179,9 +188,9 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
 
             scene.q_target_franka = scene.compute_IK(scene.GRASPS, scene.GRASPS_ROT, env_ids, is_tensor=True)
 
-            scene.mode[GRASP_MASK] = 3
+            scene.mode[GRASP_MASK] = 3 
 
-        ### Close Gripper
+
         CLOSE_GRIPPER_MASK =  (scene.mode == 3) & scene.is_target_reached(scene.GRASPS, scene.GRASPS_ROT, is_tensor=True, atol=5e-3)
         if CLOSE_GRIPPER_MASK.any():
             env_ids = CLOSE_GRIPPER_MASK.nonzero(as_tuple=False).flatten()
@@ -192,7 +201,9 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
             scene.yumi_vel_vec[CLOSE_GRIPPER_MASK]  = -1 # broadcasted
 
             scene.mode[CLOSE_GRIPPER_MASK] = 4
-        
+            
+        # TODO: Identify which object is being targeted
+        # TODO: Restart sequence if timer passed and obj not clamped in scene.mode == 4
 
         LIFT_MASK = (scene.mode == 4) & scene.is_obj_clamped()
         if LIFT_MASK.any():
@@ -209,7 +220,11 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
         if INTER_MASK.any():
             env_ids = INTER_MASK.nonzero(as_tuple=False).flatten()
         
-            scene.logger.info("LIFT position reached.")
+            scene.logger.info(f"LIFT position reached in {env_ids.cpu().tolist()}.")
+
+            scene.identify_obj_ids(env_ids)
+            # TODO: Check if obj still gripped - restart if not
+            # TODO: Change mask if still gripped / change at end
 
             scene.q_target_franka = scene.compute_IK(Poses.inter, Poses.base_rot, env_ids)
 
@@ -220,7 +235,7 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
         if DROP_MASK.any():
             env_ids = DROP_MASK.nonzero(as_tuple=False).flatten()
             
-            scene.logger.info("INTER position reached.")
+            scene.logger.info(f"INTER position reached in {env_ids.cpu().tolist()}.")
 
             scene.q_target_franka = scene.compute_IK(Poses.drop, Poses.base_rot, env_ids)
 
@@ -231,7 +246,7 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
         if OPEN_GRIPPER_MASK.any():
             env_ids = OPEN_GRIPPER_MASK.nonzero(as_tuple=False).flatten()
 
-            scene.logger.info("DROP position reached - Opening Gripper.")
+            scene.logger.info(f"DROP position reached - Opening Gripper in {env_ids.cpu().tolist()}.")
 
             scene.q_target_yumi[OPEN_GRIPPER_MASK] = 0.05
             scene.yumi_vel_vec[OPEN_GRIPPER_MASK]  = 1
@@ -245,7 +260,7 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
         if INTER_MASK2.any():
             env_ids = INTER_MASK2.nonzero(as_tuple=False).flatten()
 
-            scene.logger.info("Object Dropped.")
+            scene.logger.info(f"Object Dropped in {env_ids.cpu().tolist()}.")
             
             scene.q_target_franka = scene.compute_IK(Poses.inter, Poses.base_rot, env_ids)
 
@@ -256,16 +271,16 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
         if RESTART_MASK.any():
             env_ids = RESTART_MASK.nonzero(as_tuple=False).flatten()
 
-            scene.logger.info("Restarting Picking Sequence.")
+            scene.logger.info(f"Restarting Picking Sequence in {env_ids.cpu().tolist()}.")
 
-            scene.mode[RESTART_MASK]       = 0 ##################### 
+            scene.mode[RESTART_MASK]       = 0 
             scene.PRE_GRASPS[RESTART_MASK] = 0
             scene.GRASPS_ROT[RESTART_MASK] = 0
             scene.IS_GRASP[RESTART_MASK]   = 0
             scene.GRASPS[RESTART_MASK]     = 0
 
+
         # apply actions to gripper
-        #q_target_yumi =  torch.full_like(scene["yumi_gripper"].data.joint_pos, gripper_pose)
         scene["yumi_gripper"].set_joint_velocity_target(scene.yumi_vel_vec)
         scene["yumi_gripper"].set_joint_position_target(scene.q_target_yumi)       
         scene["franka"].set_joint_position_target(scene.q_target_franka)

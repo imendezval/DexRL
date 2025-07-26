@@ -1,7 +1,7 @@
 import numpy as np
 
 class Settings:
-    vis_DexNet      = True
+    vis_DexNet      = False
     
     num_envs        = 4
     env_spacing     = 3.0
@@ -33,7 +33,7 @@ class Prims:
 
     class KLT_Bin:
         path        = "assets/small_KLT.usd"
-        pos_pick    = (0.5,  0.3, 1.12)
+        pos_pick    = (0.5,  0.3, 1.12)  #+-0.135, +-0.195
         pos_place   = (0.5, -0.3, 1.12)
         scale       = (1.5, 1.5, 0.5)
 
@@ -43,7 +43,7 @@ class Prims:
         n_objs_ep   = 12
 
         pos_x       = 0.4
-        pos_y       = 0.2
+        pos_y       = 0.15
         x_bins      = 3
         y_bins      = 5
         spacing     = 0.06
