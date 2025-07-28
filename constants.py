@@ -19,7 +19,7 @@ class Camera:
 
     x_cam           = 0.5
     y_cam           = 0.3
-    z_cam           = 1.77
+    z_cam           = 1.55 # + 0.442
     pos             = np.array([x_cam, y_cam, z_cam])
     rot             = np.array([0, 0.7071, 0.7071, 0])
 
@@ -27,14 +27,14 @@ class Camera:
 class Prims:
     class Table:
         path        = "assets/table_instanceable.usd"
-        pos         = (0.55, 0.0, 1.05)
+        pos         = (0.55, 0.0, 1.04)
         rot         = (0.7071, 0.0, 0.0, 0.7071)
         scale       = (1.2, 1.0, 1.0)
 
     class KLT_Bin:
         path        = "assets/small_KLT.usd"
-        pos_pick    = (0.5,  0.3, 1.12)  #+-0.135, +-0.195
-        pos_place   = (0.5, -0.3, 1.12)
+        pos_pick    = (0.5,  0.3, 1.075)  #+-0.135, +-0.195
+        pos_place   = (0.5, -0.3, 1.075)
         scale       = (1.5, 1.5, 0.5)
 
     class ObjPool:
@@ -94,4 +94,4 @@ class DexNet:
     model_path      = "gqcnn/models/FC-GQCNN-4.0-PJ"             
     cam_intr_path   = "gqcnn/data/calib/phoxi/phoxi.intr"    
     cfg_path        = "gqcnn/cfg/examples/fc_gqcnn_pj.yaml"      
-    segmask_path    = "segmask.png"        
+    segmask_path    = "segmask.png"

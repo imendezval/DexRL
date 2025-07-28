@@ -21,7 +21,7 @@ from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from cfg.franka_cfg import FRANKA_PANDA_HIGH_PD_CFG
 from cfg.gripper_cfg import YUMI_CFG
 from isaaclab.assets import AssetBaseCfg, RigidObjectCfg, RigidObjectCollectionCfg, RigidObjectCollection
-from isaaclab.assets.articulation import ArticulationCfg
+from isaaclab.assets.articulation import ArticulationCfg, Articulation
 from isaaclab.sensors import CameraCfg, TiledCameraCfg
 from isaaclab.sensors import ContactSensorCfg
 import isaaclab.sim.schemas as sim_schemas
@@ -36,7 +36,8 @@ from isaacsim.robot_setup.assembler import RobotAssembler
 
 # Lula Inverse Kinematics
 enable_extension("isaacsim.robot_motion.motion_generation")
-from isaacsim.robot_motion.motion_generation import ArticulationKinematicsSolver, LulaKinematicsSolver
+from isaacsim.robot_motion.motion_generation import ArticulationKinematicsSolver, LulaKinematicsSolver, \
+                                                    LulaTaskSpaceTrajectoryGenerator, ArticulationTrajectory
 from isaacsim.robot_motion.motion_generation import interface_config_loader
 from isaacsim.core.prims import SingleArticulation
 
@@ -55,13 +56,6 @@ OBJ_PATTERNS = [
     for i in range(ObjPool.n_obj_pool)      # 0 … 128
 ]
 
-
-# @configclass
-# class XformCfg(SpawnerCfg):
-#     func = staticmethod(lambda prim_path, cfg,
-#                         translation=None, orientation=None:
-#                         prim_utils.create_prim(prim_path, "Xform",
-#                                                translation, orientation))
 
 class ObjectPool(object):
 
@@ -139,28 +133,8 @@ class FrankaSceneCfg(InteractiveSceneCfg):
         ),
         init_state = AssetBaseCfg.InitialStateCfg(pos=Prims.KLT_Bin.pos_place)
     )
-
-    # cube = RigidObjectCfg(
-    #     prim_path="{ENV_REGEX_NS}/cube",
-    #     spawn=sim_utils.MeshCuboidCfg(
-    #         size=(0.03, 0.03, 0.03),
-    #         physics_material=sim_utils.materials.RigidBodyMaterialCfg(
-    #             dynamic_friction=1.0, static_friction=1.0, restitution=0.05 # match with gripper
-    #         ),
-    #         rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
-    #         mass_props=sim_utils.MassPropertiesCfg(mass=0.25),
-    #         collision_props=sim_utils.CollisionPropertiesCfg(),
-    #         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
-    #     ),
-    #     init_state=RigidObjectCfg.InitialStateCfg(pos=(0.6, 0.3, 1.15)),
-    # )
     
     # Object Pool
-    # helpers_folder = AssetBaseCfg(
-    #     prim_path="{ENV_REGEX_NS}/ObjPool",
-    #     spawn=XformCfg()
-    # )
-
     obj_pool = RigidObjectCollectionCfg(
                 rigid_objects=ObjectPool().object_pool_cfg
     )
@@ -186,10 +160,10 @@ class FrankaSceneCfg(InteractiveSceneCfg):
     offset=CameraCfg.OffsetCfg(pos=tuple(Camera.pos), rot=tuple(Camera.rot), convention="ros"),
     )
 
-    contact_forces_L = ContactSensorCfg(prim_path = "{ENV_REGEX_NS}/yumi_gripper/yumi_gripper/gripper_finger_l", filter_prim_paths_expr = OBJ_PATTERNS)
-    contact_forces_R = ContactSensorCfg(prim_path = "{ENV_REGEX_NS}/yumi_gripper/yumi_gripper/gripper_finger_r", filter_prim_paths_expr = OBJ_PATTERNS)
-    # compute_first_contact
-    # compute_first_air
+    contact_forces_L = ContactSensorCfg(prim_path = "{ENV_REGEX_NS}/yumi_gripper/yumi_gripper/gripper_finger_l", 
+                                        filter_prim_paths_expr = OBJ_PATTERNS)
+    contact_forces_R = ContactSensorCfg(prim_path = "{ENV_REGEX_NS}/yumi_gripper/yumi_gripper/gripper_finger_r", 
+                                        filter_prim_paths_expr = OBJ_PATTERNS)
 
 
 
@@ -199,28 +173,49 @@ class FrankaScene(InteractiveScene):
 
         self.logger = logging.getLogger(__name__)
 
+        self.env_ids = torch.as_tensor([env_id for env_id in range(self.num_envs)], device=self.device)
+
         self._arm_path_loc      = "/Franka/franka_instanceable"
         self._gripper_path_loc  = "/yumi_gripper/yumi_gripper"
+        self.end_effector_name  = "right_gripper" # panda_link8 panda_wrist_end_pt
 
-        self._franka_assets     = []
-        self._kinematics_solver = None
+        # Kinematics Solver
+        self._franka_assets        = []
+        self._kinematics_solver    = None
         self._articulation_kinematics_solvers = []
+        # Trajectory Generator
+        self._franka_articulations = []
+        self._taskspace_trajectory_generator  = None
+        self.action_sequence    = [None for _ in range(self.num_envs)]
+        self.sequence_step_init = [None for _ in range(self.num_envs)]
 
-        self.q_target_franka   = None #self.articulations["franka"]._data.default_joint_pos.clone()
+        # Joint Targets - init in main
+        self.q_target_franka   = None
         self.q_target_yumi     = None
         self.yumi_vel_vec      = None
 
+        # Sequence Flags
         self.mode    = torch.full((self.num_envs,), -2, dtype=torch.long, device=self.device)
         self.counter = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
 
+        # DexNet Requests
         self.DexNet_request = [None for _ in range(self.num_envs)]
+        self.request_state  = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
+        # DexNet Grasps
         self.GRASPS     = torch.zeros(self.num_envs, 3, device=self.device)
         self.PRE_GRASPS = torch.zeros(self.num_envs, 3, device=self.device)
         self.GRASPS_ROT = torch.zeros(self.num_envs, 4, device=self.device)
-        self.IS_GRASP   = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-        self.gripped_obj_ids    = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
 
+        # Bookkeeping
+        self.gripped_objs      = torch.full((self.num_envs,), -1, 
+                                        dtype=torch.long, device=self.device)
+        self.gripped_objs_prev = torch.full((self.num_envs,), -1, 
+                                        dtype=torch.long, device=self.device)
+        self.grip_log          = torch.zeros(ObjPool.n_obj_pool, 2, 
+                                        dtype=torch.uint8, device=self.device)
+        self.fail_streaks      = torch.zeros(self.num_envs,
+                                        dtype=torch.uint8, device=self.device)
 
 
     def setup_post_load(self):
@@ -251,15 +246,23 @@ class FrankaScene(InteractiveScene):
 
     def _load_InverseKinematics(self):
         kinematics_config = interface_config_loader.load_supported_lula_kinematics_solver_config("Franka")
-        self._kinematics_solver = LulaKinematicsSolver(**kinematics_config)
 
-        end_effector_name = "right_gripper" #panda_link8 #right_gripper #panda_wrist_end_pt
+        self._kinematics_solver              = LulaKinematicsSolver(**kinematics_config)
+        self._taskspace_trajectory_generator = LulaTaskSpaceTrajectoryGenerator(**kinematics_config)
+    
+        robot_base_translation, robot_base_orientation = np.array([0.0, 0.0, 1.05]), np.array([1.0, 0.0, 0.0, 0.0])
+        self._kinematics_solver.set_robot_base_pose(robot_base_translation, robot_base_orientation)        
+
         for env_path in self.env_prim_paths:
             franka_path = env_path + self._arm_path_loc
-            franka_single = SingleArticulation(franka_path)
+
+            # franka_articulation = Articulation(franka_path)
+            # self._franka_articulations.append(franka_articulation)
+
+            franka_single       = SingleArticulation(franka_path)
             self._franka_assets.append(franka_single)
 
-            articulation_IK_solver = ArticulationKinematicsSolver(franka_single, self._kinematics_solver, end_effector_name)
+            articulation_IK_solver = ArticulationKinematicsSolver(franka_single, self._kinematics_solver, self.end_effector_name)
             self._articulation_kinematics_solvers.append(articulation_IK_solver)
         
             ###
@@ -286,14 +289,11 @@ class FrankaScene(InteractiveScene):
             franka.initialize()
 
 
-    def compute_IK(self, target_pos, target_rot, env_ids, is_tensor = False):
+    def compute_IK(self, target_pos, target_rot, env_ids, is_tensor: bool = False):
 
         q_target = self.q_target_franka.clone()
 
         for env_id in env_ids.cpu().tolist():
-
-            robot_base_translation, robot_base_orientation = np.array([0.0, 0.0, 1.05]), np.array([1.0, 0.0, 0.0, 0.0])
-            self._kinematics_solver.set_robot_base_pose(robot_base_translation, robot_base_orientation)
 
             if is_tensor:
                 pos_np = target_pos[env_id].cpu().numpy()
@@ -313,6 +313,48 @@ class FrankaScene(InteractiveScene):
         return q_target
     
 
+    def compute_IK_trajectory(self, target_pos, current_pos, target_rot, env_ids, step_init):
+
+        for env_id in env_ids.cpu().tolist():
+
+            curr_np = current_pos[env_id].cpu().numpy()
+            pos_np  = target_pos[env_id].cpu().numpy()
+            rot_np  = target_rot[env_id].cpu().numpy()
+
+            pos_targets  = np.array([curr_np, pos_np])
+            pos_targets[:, 2] -= 1.05
+            quat_targets = np.tile(rot_np, (2,1))
+
+            trajectory = self._taskspace_trajectory_generator.compute_task_space_trajectory_from_points(
+                pos_targets, quat_targets, self.end_effector_name
+            )
+
+            articulation_trajectory = ArticulationTrajectory(self._franka_assets[0], trajectory, self.physics_dt)
+            self.action_sequence[env_id]    = articulation_trajectory.get_action_sequence()
+            self.sequence_step_init[env_id] = step_init
+    
+
+    def update_IK_trajectory(self, env_ids, time_step):
+        q_target = self.q_target_franka.clone()
+
+        for env_id in env_ids.cpu().tolist():
+            step = int((time_step - self.sequence_step_init[env_id]) / 2)
+
+            if step > len(self.action_sequence[env_id]) - 1:
+                action = self.action_sequence[env_id][-1]
+            else:
+                action = self.action_sequence[env_id][step]
+
+            ik_pos = torch.tensor(
+                action.joint_positions,
+                dtype   = self.articulations["franka"].data.joint_pos.dtype,
+                device  = self.articulations["franka"].data.joint_pos.device,
+            )
+
+            q_target[env_id] = ik_pos
+
+        return q_target
+
     def is_counter_reached(self, time_step: int):
 
         t = torch.as_tensor(time_step, device=self.counter.device)
@@ -323,8 +365,7 @@ class FrankaScene(InteractiveScene):
         return counter_mask
     
 
-    def is_target_reached(self, target_pos, target_rot, is_tensor = False, atol=5e-3):
-
+    def is_target_reached(self, target_pos, target_rot, is_tensor: bool = False, atol=5e-3):
         
         if not is_tensor:
             if target_pos is None or target_rot is None:
@@ -333,6 +374,22 @@ class FrankaScene(InteractiveScene):
             # (E, 3), (E, 4)
             target_pos = torch.as_tensor(target_pos, device=self.counter.device, dtype=torch.float32).unsqueeze(0).expand(self.num_envs, -1)
             target_rot = torch.as_tensor(target_rot, device=self.counter.device, dtype=torch.float32).unsqueeze(0).expand(self.num_envs, -1)
+
+
+        ee_pos, ee_rot = self.get_curr_poses() # (E, 3), (E, 4)
+
+        pos_err = torch.norm(ee_pos - target_pos, dim=-1)
+        rot_err = quat_diff_mag(ee_rot, target_rot)
+
+        is_target_reached = (pos_err < atol) & (rot_err < atol)
+
+        if is_tensor:
+            is_target_reached = is_target_reached & (self.request_state == 2)
+        
+        return is_target_reached
+    
+
+    def get_curr_poses(self):
 
         ee_pos_list = []
         ee_rot_list = []
@@ -346,22 +403,14 @@ class FrankaScene(InteractiveScene):
         ee_pos = torch.stack(ee_pos_list) # (E, 3)
         ee_rot = torch.stack(ee_rot_list) # (E, 4)
 
-        pos_err = torch.norm(ee_pos - target_pos, dim=-1)
-        rot_err = quat_diff_mag(ee_rot, target_rot)
-
-        is_target_reached = (pos_err < atol) & (rot_err < atol)
-
-        if is_tensor:
-            is_target_reached = is_target_reached & (self.IS_GRASP == 2)
-        
-        return is_target_reached
-
+        return ee_pos, ee_rot
+    
 
     def is_obj_clamped(self, thresh = 0.5):
         
-        force_L = self.sensors["contact_forces_L"].data.net_forces_w
+        force_L = self.sensors["contact_forces_L"].data.net_forces_w # (E, 1, 3)
         force_R = self.sensors["contact_forces_R"].data.net_forces_w
-#
+
         force_L_mag = torch.linalg.norm(force_L, dim=-1)
         force_R_mag = torch.linalg.norm(force_R, dim=-1)
 
@@ -370,15 +419,53 @@ class FrankaScene(InteractiveScene):
         return obj_clamped_mask.squeeze(-1)
     
     
-    def identify_obj_ids(self, env_ids):
+    def update_grip_stats(self, env_ids: torch.tensor, is_success: bool = True):
+
         force_tensor = self.sensors["contact_forces_L"].data.force_matrix_w # (E, 1, N, 3)
-        forces = force_tensor.squeeze(1) # (E, N, 3)
+        forces = force_tensor.squeeze(1)        # (E, N, 3)
         mag = torch.linalg.norm(forces, dim=-1) # (E, N)
-        print(mag[env_ids, :].max())
 
-        obj_idx = mag[env_ids, :].argmax(dim=-1)  
+        values, obj_ids = mag[env_ids, :].max(dim=-1)
+        no_id = (values == 0)
+        if no_id.any():
+            env_ids_no_id = env_ids[no_id]
 
-        self.gripped_obj_ids[env_ids] = obj_idx
+            obj_ids_pose = self.get_objs_closest_TCP(env_ids_no_id)         
+
+            obj_ids[env_ids_no_id] = obj_ids_pose
+
+
+        self.gripped_objs_prev[env_ids] = self.gripped_objs[env_ids]
+        self.gripped_objs[env_ids] = obj_ids
+
+        if is_success:
+            self.grip_log[obj_ids.long(), 0] += 1
+            self.fail_streaks[env_ids] = 0
+            return
+
+        self.grip_log[obj_ids.long(), 1] += 1
+
+        same_obj_mask = (self.gripped_objs[env_ids] == self.gripped_objs_prev[env_ids]) # (len(env_ids), )
+        same_obj_envs = env_ids[same_obj_mask]
+        diff_obj_envs = env_ids[~same_obj_mask] 
+         
+        self.fail_streaks[same_obj_envs] += 1
+        self.fail_streaks[diff_obj_envs] = 0
+
+    
+    def get_objs_closest_TCP(self, env_ids):
+        TCP_poses, _ = self.get_curr_poses()    # (E, 3)
+        TCP_poses    = TCP_poses[env_ids].unsqueeze(1) # (E, 1, 3)
+
+        obj_poses = self.rigid_object_collections["obj_pool"].root_physx_view.get_transforms() # (E * N, 7)
+        obj_poses = obj_poses.view(self.num_envs, -1, 7) # (E, N, 7)
+        obj_poses = obj_poses[env_ids, :, :3] # (E, N, 3)
+
+        diffs = torch.norm(obj_poses - TCP_poses, dim=-1)
+
+        idxs = diffs.argmin(dim=1)
+
+        return idxs
 
     
     def request_DexNet_pred(self, env_ids):
@@ -400,7 +487,7 @@ class FrankaScene(InteractiveScene):
             req = grequests.post(DexNet.url, json=payload)
             self.DexNet_request[env_id] = grequests.send(req)
 
-            self.IS_GRASP[env_id] = 1
+            self.request_state[env_id] = 1
 
 
     def get_DexNet_pred(self, env_ids, grasps_DexNet):
@@ -420,9 +507,9 @@ class FrankaScene(InteractiveScene):
             )
 
             self.DexNet_request[env_id] = None
-            self.IS_GRASP[env_id]       = 2
+            self.request_state[env_id]       = 2
             
-            self.logger.info(f"Successfully received grasp predictions from Dex-Net for environment {env_id}")
+            self.logger.info(f"Received grasp predictions from Dex-Net in {env_id}")
 
             grasps_DexNet[env_id] = [Grasp(row) for row in grasps_np]
 
@@ -486,7 +573,7 @@ class ObjectGenerator(object):
                           device=self.device)
             for _ in range(len(env_ids))]
         )
-        self.obj_ids[env_ids] = obj_ids
+        self.obj_ids[env_ids] = obj_ids # (E, N)
 
         view_ids = self._env_obj_ids_to_view_ids_abstract(env_ids, obj_ids).to(torch.uint32)
 
@@ -500,55 +587,76 @@ class ObjectGenerator(object):
         # Visibility???
         ...
 
-    
-    def _env_obj_ids_to_view_ids_abstract(
-        self, env_ids: torch.Tensor, object_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        ...
 
-        Parameters
-        ----------
-        env_ids: Tensor
-            (E,)
-        object_ids : Tensor
-            (E, N)
-        """
-        view_ids = (object_ids * self.num_envs + env_ids.unsqueeze(1)).flatten()
+    def is_bin_empty(self, env_ids):
 
-        return view_ids
+        obj_pool_poses = self.view.get_transforms()
+        obj_pool_poses = obj_pool_poses.view(len(env_ids), -1, 7)
+        obj_pool_poses = obj_pool_poses[env_ids, ...]
+
+        obj_pool_poses_rel = obj_pool_poses[..., :2] - self.env_origins[:, :2].unsqueeze(1) # (E, N, 2) - # (E, 1, 2)
+
+        objs_outside_bin = ( # (E, N)
+            (obj_pool_poses_rel[..., 0] <  ObjPool.pos_x)           |   
+            (obj_pool_poses_rel[..., 0] > (ObjPool.pos_x + 0.27))   |
+            (obj_pool_poses_rel[..., 1] <  ObjPool.pos_y)           |
+            (obj_pool_poses_rel[..., 1] > (ObjPool.pos_y + 0.39))
+        )
+
+        bin_empty = objs_outside_bin.all(dim=1)
+        return bin_empty
+
+
+    def remove_objs(self, env_ids, obj_ids):
+
+        view_ids = self._env_obj_ids_to_view_ids_abstract(env_ids, obj_ids).to(torch.uint32)
+        object_poses = self.org_pos[view_ids.long()]
+
+        self.write_object_pose_to_sim_abstract(object_poses.view(len(env_ids), -1, 7), view_ids, env_ids, obj_ids)
     
 
     def restart_pool(self, env_ids):
-        view_ids = self._env_obj_ids_to_view_ids_abstract(env_ids, self.obj_ids[env_ids]).to(torch.uint32)
 
-        object_poses = self.org_pos[view_ids.long()]
-        self.write_object_pose_to_sim_abstract(object_poses.view(len(env_ids), ObjPool.n_objs_ep, 7), view_ids, env_ids, self.obj_ids[env_ids])
+        self.remove_objs(env_ids, self.obj_ids[env_ids])
 
     
     def clean_pool(self, env_ids):
+        # Get Poses of current objects in bin
+        obj_ids       = self.obj_ids[env_ids]
+        view_ids_bin  = self._env_obj_ids_to_view_ids_abstract(env_ids, obj_ids).to(torch.uint32)
 
         obj_pool_poses = self.view.get_transforms()
-
-        obj_ids   = self.obj_ids[env_ids]
-        view_ids_bin  = self._env_obj_ids_to_view_ids_abstract(env_ids, obj_ids).to(torch.uint32)
-        obj_bin_poses = obj_pool_poses[view_ids_bin.long()].view(len(env_ids), ObjPool.n_objs_ep, 7)
+        obj_bin_poses  = obj_pool_poses[view_ids_bin.long()]
+        obj_bin_poses  = obj_bin_poses.view(len(env_ids), ObjPool.n_objs_ep, 7)
 
         obj_bin_poses_rel = obj_bin_poses[..., :2] - self.env_origins[:, :2].unsqueeze(1) # (E, N, 2) - # (E, 1, 2)
 
+        # Mask out if not in bin
         mask_out = ( # (E, N)
             (obj_bin_poses_rel[..., 0] <  ObjPool.pos_x)           |   
             (obj_bin_poses_rel[..., 0] > (ObjPool.pos_x + 0.27))   |
             (obj_bin_poses_rel[..., 1] <  ObjPool.pos_y)           |
             (obj_bin_poses_rel[..., 1] > (ObjPool.pos_y + 0.39))
         )
-        obj_ids_outside_bin = obj_ids[mask_out]
 
+        # obj_ids_outside_bin = obj_ids[mask_out]
+        # Cannot be done in parallel since different N objects per env possible
+        # then obj_ids_outside_bin.shape == (K, ), doesn´t work for -> view_ids + object_state_w
+        for i, env_id in enumerate(env_ids):
 
-        view_ids_bin_out     = self._env_obj_ids_to_view_ids_abstract(env_ids, obj_ids_outside_bin).to(torch.uint32)
-        object_poses_bin_out = self.org_pos[view_ids_bin_out.long()]
+            if not mask_out[i].any():
+                continue
 
-        self.write_object_pose_to_sim_abstract(object_poses_bin_out.view(len(env_ids), -1, 7), view_ids_bin_out, env_ids, obj_ids_outside_bin)
+            env_id = env_id.view(-1) 
+
+            obj_ids_outside_bin = obj_ids[i, mask_out[i]].unsqueeze(0) # (N, ) -> (1, N)
+
+            # Get original poses of masked out objects
+            view_ids_bin_out     = self._env_obj_ids_to_view_ids_abstract(env_id, obj_ids_outside_bin).to(torch.uint32)
+            object_poses_bin_out = self.org_pos[view_ids_bin_out.long()]
+
+            self.write_object_pose_to_sim_abstract(object_poses_bin_out.view(1, -1, 7), view_ids_bin_out, env_id, obj_ids_outside_bin)
+        
 
         self.is_obj_id_in_bin[env_ids] = ~mask_out
 
@@ -603,7 +711,7 @@ class ObjectGenerator(object):
                                             ObjPool.pos_x,
                                             ObjPool.pos_y,
                                             N, env_id)
-            for env_id in env_ids.cpu().tolist()]) # (E, N, 2)2
+            for env_id in env_ids.cpu().tolist()]) # (E, N, 2)
 
         z  = torch.empty((len(env_ids), N, 1), device=self.device).uniform_(ObjPool.z_min, ObjPool.z_max) # (E, N, 1)
         
@@ -634,6 +742,7 @@ class ObjectGenerator(object):
         N : int
             How many unique positions you need.
         """
+        # TODO: Improve to take in center of Bin and its size
 
         x0_env = x0 + self.env_origins[env_id, 0]
         y0_env = y0 + self.env_origins[env_id, 1]
@@ -672,6 +781,24 @@ class ObjectGenerator(object):
         return q[..., (3, 0, 1, 2)]
     
 
+    def _env_obj_ids_to_view_ids_abstract(
+        self, env_ids: torch.Tensor, object_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        ...
+
+        Parameters
+        ----------
+        env_ids: Tensor
+            (E,)
+        object_ids : Tensor
+            (E, N)
+        """
+        view_ids = (object_ids * self.num_envs + env_ids.unsqueeze(1)).flatten()
+
+        return view_ids
+
+
     def write_object_pose_to_sim_abstract(
         self,
         object_pose: torch.Tensor,
@@ -681,7 +808,7 @@ class ObjectGenerator(object):
     ):
 
         # set into internal buffers
-        self.obj_pool._data.object_state_w[env_ids[:, None], object_ids, :7] = object_pose.clone() ######
+        self.obj_pool._data.object_state_w[env_ids[:, None], object_ids, :7] = object_pose.clone()
         
         # convert the quaternion from wxyz to xyzw
         poses_xyzw = self.obj_pool._data.object_state_w[..., :7].clone()

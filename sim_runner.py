@@ -4,7 +4,7 @@
 import logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(levelname)s - %(message)s', # %(asctime)s
 )
 
 from gevent import monkey
@@ -120,7 +120,7 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
         # 9     Restart cycle
 
 
-        DEXNET_MASK = (scene.IS_GRASP == 1)
+        DEXNET_MASK = (scene.request_state == 1)
         if DEXNET_MASK.any():
             env_ids = DEXNET_MASK.nonzero(as_tuple=False).flatten()
 
@@ -136,7 +136,7 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
             scene.logger.info(f"Object Generator started in {env_ids.cpu().tolist()}")
 
             ObjGen.generate_objects(env_ids)
-            scene.counter[REGENERATE_MASK] = step_count + 100
+            scene.counter[REGENERATE_MASK] = step_count + 120 # Wait - cleaning pool
 
             scene.mode[REGENERATE_MASK] = -1
 
@@ -146,7 +146,7 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
             env_ids = CLEAN_MASK.nonzero(as_tuple=False).flatten()
 
             ObjGen.clean_pool(env_ids)
-            scene.counter[CLEAN_MASK] = step_count + 10
+            scene.counter[CLEAN_MASK] = step_count + 6 # Wait - DexNet scan
 
             scene.mode[env_ids] = 0
 
@@ -163,7 +163,7 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
 
         PRE_GRASP_MASK = ((scene.mode == 1) &
                           scene.is_target_reached(Poses.setup, Poses.base_rot) &
-                          (scene.IS_GRASP == 2))
+                          (scene.request_state == 2))
         if PRE_GRASP_MASK.any():
             env_ids = PRE_GRASP_MASK.nonzero(as_tuple=False).flatten()
 
@@ -186,24 +186,30 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
 
             scene.logger.info(f"PRE-GRASP position reached in {env_ids.cpu().tolist()}.")
 
-            scene.q_target_franka = scene.compute_IK(scene.GRASPS, scene.GRASPS_ROT, env_ids, is_tensor=True)
+            scene.compute_IK_trajectory(scene.GRASPS, scene.PRE_GRASPS, scene.GRASPS_ROT, env_ids, step_count)
 
-            scene.mode[GRASP_MASK] = 3 
+            scene.mode[GRASP_MASK]    = 3 
+            scene.counter[GRASP_MASK] = step_count + 120 # Wait - Clamp sequence fail check
+
+        
+        UPDATE_TRAYECTORY_MASK = (scene.mode == 3)
+        if UPDATE_TRAYECTORY_MASK.any():
+            env_ids = UPDATE_TRAYECTORY_MASK.nonzero(as_tuple=False).flatten()
+            
+            scene.q_target_franka = scene.update_IK_trajectory(env_ids, step_count)
 
 
-        CLOSE_GRIPPER_MASK =  (scene.mode == 3) & scene.is_target_reached(scene.GRASPS, scene.GRASPS_ROT, is_tensor=True, atol=5e-3)
+        CLOSE_GRIPPER_MASK = (scene.mode == 3) & scene.is_target_reached(scene.GRASPS, scene.GRASPS_ROT, is_tensor=True, atol=5e-3)
         if CLOSE_GRIPPER_MASK.any():
             env_ids = CLOSE_GRIPPER_MASK.nonzero(as_tuple=False).flatten()
 
             scene.logger.info(f"GRASP position reached - Closing Gripper in {env_ids.cpu().tolist()}.")
 
             scene.q_target_yumi[CLOSE_GRIPPER_MASK] = 0
-            scene.yumi_vel_vec[CLOSE_GRIPPER_MASK]  = -1 # broadcasted
+            scene.yumi_vel_vec[CLOSE_GRIPPER_MASK]  = -1
 
             scene.mode[CLOSE_GRIPPER_MASK] = 4
-            
-        # TODO: Identify which object is being targeted
-        # TODO: Restart sequence if timer passed and obj not clamped in scene.mode == 4
+
 
         LIFT_MASK = (scene.mode == 4) & scene.is_obj_clamped()
         if LIFT_MASK.any():
@@ -213,7 +219,67 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
 
             scene.q_target_franka = scene.compute_IK(scene.PRE_GRASPS, scene.GRASPS_ROT, env_ids, is_tensor=True)
 
-            scene.mode[LIFT_MASK] = 5
+            scene.mode[LIFT_MASK]    = 5
+            scene.counter[LIFT_MASK] = -1
+
+
+        ### FAILURES ###
+        FAIL_GRIP_MASK = (
+                (((scene.mode == 3) | (scene.mode == 4)) & scene.is_counter_reached(step_count)) |
+                ((scene.mode == 5) & (~scene.is_obj_clamped(thresh=0.1)))
+        )
+        if FAIL_GRIP_MASK.any(): # GRASP POSITION NOT REACHED / CLAMP WAS BAD (didnt reach pre-grasp)
+            env_ids = FAIL_GRIP_MASK.nonzero(as_tuple=False).flatten()
+
+            scene.logger.info(f"FAIL - GRIP in {env_ids.cpu().tolist()} - RESTARTING SEQUENCE.")
+
+            # Bookkeep obj_id grip fail + fail streaks
+            scene.update_grip_stats(env_ids, is_success=False)
+
+            # Open Gripper and retract safe distance
+            scene.q_target_yumi[FAIL_GRIP_MASK] = 0.05
+            scene.yumi_vel_vec[FAIL_GRIP_MASK]  = 1
+            scene.q_target_franka = scene.compute_IK(scene.PRE_GRASPS, scene.GRASPS_ROT, env_ids, is_tensor=True)
+
+            scene.mode[FAIL_GRIP_MASK]    = 8
+            scene.counter[FAIL_GRIP_MASK] = step_count + 30 # Wait - retract safe distance
+
+        
+        FAIL_DROP_MASK = (
+                ((scene.mode == 6) | (scene.mode == 7)) &
+                (~scene.is_obj_clamped(thresh=0.1))
+        )
+        if FAIL_DROP_MASK.any(): # OBJECT DROPPED EARLY
+            env_ids = FAIL_DROP_MASK.nonzero(as_tuple=False).flatten()
+            
+            scene.logger.info(f"FAIL - DROP in {env_ids.cpu().tolist()} - RESTARTING SEQUENCE.")
+            
+            # Bookkeep obj_id grip fail + fail streaks
+            scene.update_grip_stats(env_ids, is_success=False)
+            print(scene.fail_streaks)
+            print(scene.gripped_objs)
+
+            # Open Gripper and retract safe distance
+            scene.q_target_yumi[FAIL_DROP_MASK] = 0.05
+            scene.yumi_vel_vec[FAIL_DROP_MASK]  = 1
+
+            ee_poses, ee_rots = scene.get_curr_poses()
+            ee_poses[:, 2] += 0.15
+            scene.q_target_franka = scene.compute_IK(ee_poses, ee_rots, env_ids, is_tensor=True)
+
+
+            scene.mode[FAIL_DROP_MASK]    = 8
+            scene.counter[FAIL_DROP_MASK] = step_count + 30 # Wait - retract safe distance
+        
+
+        REMOVE_OBJ_MASK = (FAIL_GRIP_MASK | FAIL_DROP_MASK) & (scene.fail_streaks == 2)
+        if REMOVE_OBJ_MASK.any():
+            env_ids = REMOVE_OBJ_MASK.nonzero(as_tuple=False).flatten()
+            
+            scene.logger.info(f"Object grip failed 3 consecutive times in {env_ids.cpu().tolist()} - removing.")
+            ...
+
+            ObjGen.remove_objs(env_ids, scene.gripped_objs[env_ids].unsqueeze(1)) # (E, 1)
 
 
         INTER_MASK = (scene.mode == 5) & scene.is_target_reached(scene.PRE_GRASPS, scene.GRASPS_ROT, is_tensor=True, atol=1e-2)
@@ -221,10 +287,6 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
             env_ids = INTER_MASK.nonzero(as_tuple=False).flatten()
         
             scene.logger.info(f"LIFT position reached in {env_ids.cpu().tolist()}.")
-
-            scene.identify_obj_ids(env_ids)
-            # TODO: Check if obj still gripped - restart if not
-            # TODO: Change mask if still gripped / change at end
 
             scene.q_target_franka = scene.compute_IK(Poses.inter, Poses.base_rot, env_ids)
 
@@ -248,6 +310,9 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
 
             scene.logger.info(f"DROP position reached - Opening Gripper in {env_ids.cpu().tolist()}.")
 
+            # Bookkeep obj_id grip success
+            scene.update_grip_stats(env_ids, is_success=True)
+
             scene.q_target_yumi[OPEN_GRIPPER_MASK] = 0.05
             scene.yumi_vel_vec[OPEN_GRIPPER_MASK]  = 1
 
@@ -260,7 +325,7 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
         if INTER_MASK2.any():
             env_ids = INTER_MASK2.nonzero(as_tuple=False).flatten()
 
-            scene.logger.info(f"Object Dropped in {env_ids.cpu().tolist()}.")
+            scene.logger.info(f"Heading to INTER to restart sequence in {env_ids.cpu().tolist()}.")
             
             scene.q_target_franka = scene.compute_IK(Poses.inter, Poses.base_rot, env_ids)
 
@@ -273,11 +338,21 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
 
             scene.logger.info(f"Restarting Picking Sequence in {env_ids.cpu().tolist()}.")
 
-            scene.mode[RESTART_MASK]       = 0 
-            scene.PRE_GRASPS[RESTART_MASK] = 0
-            scene.GRASPS_ROT[RESTART_MASK] = 0
-            scene.IS_GRASP[RESTART_MASK]   = 0
-            scene.GRASPS[RESTART_MASK]     = 0
+            scene.GRASPS[RESTART_MASK]        = 0
+            scene.PRE_GRASPS[RESTART_MASK]    = 0
+            scene.GRASPS_ROT[RESTART_MASK]    = 0
+            scene.request_state[RESTART_MASK] = 0
+
+
+            EMPTY_BIN_MASK = ObjGen.is_bin_empty(env_ids)
+            env_ids_empty_bin = env_ids[EMPTY_BIN_MASK]
+            env_ids_full_bin  = env_ids[~EMPTY_BIN_MASK]
+
+            scene.mode[env_ids_full_bin]  = 0
+            scene.mode[env_ids_empty_bin] = -2
+
+            # TODO: Reposition bin if moved + regenerate?
+            # TODO: Gripper friction unpaired
 
 
         # apply actions to gripper
