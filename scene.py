@@ -354,6 +354,7 @@ class FrankaScene(InteractiveScene):
             q_target[env_id] = ik_pos
 
         return q_target
+    
 
     def is_counter_reached(self, time_step: int):
 
@@ -591,10 +592,10 @@ class ObjectGenerator(object):
     def is_bin_empty(self, env_ids):
 
         obj_pool_poses = self.view.get_transforms()
-        obj_pool_poses = obj_pool_poses.view(len(env_ids), -1, 7)
+        obj_pool_poses = obj_pool_poses.view(self.num_envs, -1, 7)
         obj_pool_poses = obj_pool_poses[env_ids, ...]
 
-        obj_pool_poses_rel = obj_pool_poses[..., :2] - self.env_origins[:, :2].unsqueeze(1) # (E, N, 2) - # (E, 1, 2)
+        obj_pool_poses_rel = obj_pool_poses[..., :2] - self.env_origins[env_ids, :2].unsqueeze(1) # (E, N, 2) - # (E, 1, 2)
 
         objs_outside_bin = ( # (E, N)
             (obj_pool_poses_rel[..., 0] <  ObjPool.pos_x)           |   

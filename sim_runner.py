@@ -43,7 +43,6 @@ Poses.inter   = offset_target_pos(Poses.inter_TCP)
 Poses.drop    = offset_target_pos(Poses.drop_TCP)
 
 # TODO: Check Franka Arm reaches and rotations
-# TODO: Detect if object has been lifted (/bin moved?)
 # TODO: Update SegMask
 def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
     sim_dt = sim.get_physics_dt()

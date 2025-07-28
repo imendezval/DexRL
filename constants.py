@@ -19,7 +19,7 @@ class Camera:
 
     x_cam           = 0.5
     y_cam           = 0.3
-    z_cam           = 1.55 # + 0.442
+    z_cam           = 1.65 # + 0.442
     pos             = np.array([x_cam, y_cam, z_cam])
     rot             = np.array([0, 0.7071, 0.7071, 0])
 
