@@ -347,7 +347,11 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
             scene.mode[env_ids_full_bin]  = 0
             scene.mode[env_ids_empty_bin] = -2
 
+            scene.fail_streaks[env_ids_empty_bin] = 0
+            scene.gripped_objs[env_ids_empty_bin] = -1
+
             # TODO: Reposition bin if moved + regenerate?
+            # TODO: q of action = 0 case
             # TODO: Gripper friction unpaired
 
 

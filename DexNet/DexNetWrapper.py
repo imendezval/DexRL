@@ -24,6 +24,7 @@ class DexNetWrapper(object):
 
         self._get_filenames()  
         
+        self.grasp_count = 1
 
         self.camera_intr = CameraIntrinsics.load(self.camera_intr_path)
         self.segmask = BinaryImage.open(self.segmask_path)
@@ -50,6 +51,8 @@ class DexNetWrapper(object):
         grasps = self.predict_grasps()
         if vis:
             self.visualize_grasps(grasps, rgbd_im)
+
+        self.grasp_count += 1
 
         return grasps
     
@@ -117,4 +120,4 @@ class DexNetWrapper(object):
         vis.grasp(actions[0].grasp, scale=2.5, show_center=False, show_axis=True)
         vis.title("Planned grasp at depth {0:.3f}m with Q={1:.3f}".format(
             actions[0].grasp.depth, actions[0].q_value))
-        vis.show()
+        vis.show(filename = f"./DexNet/grasp_{self.grasp_count}")

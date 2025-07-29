@@ -44,18 +44,15 @@ from isaacsim.core.prims import SingleArticulation
 
 from helpers import Grasp, mat_to_quat, quat_diff_mag, offset_target_pos
 from constants import Camera, Prims, RobotArm, DexNet, Settings
-
 ObjPool = Prims.ObjPool
-
-
 
 dir_ = os.path.dirname(os.path.realpath(__file__))
 
-OBJ_PATTERNS = [
-    f"{{ENV_REGEX_NS}}/obj_{i}"
-    for i in range(ObjPool.n_obj_pool)      # 0 … 128
-]
 
+ObjPool_filter_paths = [
+    f"{{ENV_REGEX_NS}}/obj_{i}"
+    for i in range(ObjPool.n_obj_pool)
+]
 
 class ObjectPool(object):
 
@@ -161,9 +158,9 @@ class FrankaSceneCfg(InteractiveSceneCfg):
     )
 
     contact_forces_L = ContactSensorCfg(prim_path = "{ENV_REGEX_NS}/yumi_gripper/yumi_gripper/gripper_finger_l", 
-                                        filter_prim_paths_expr = OBJ_PATTERNS)
+                                        filter_prim_paths_expr = ObjPool_filter_paths)
     contact_forces_R = ContactSensorCfg(prim_path = "{ENV_REGEX_NS}/yumi_gripper/yumi_gripper/gripper_finger_r", 
-                                        filter_prim_paths_expr = OBJ_PATTERNS)
+                                        filter_prim_paths_expr = ObjPool_filter_paths)
 
 
 
@@ -599,10 +596,10 @@ class ObjectGenerator(object):
         obj_pool_poses_rel = obj_pool_poses[..., :2] - self.env_origins[env_ids, :2].unsqueeze(1) # (E, N, 2) - # (E, 1, 2)
 
         objs_outside_bin = ( # (E, N)
-            (obj_pool_poses_rel[..., 0] <  ObjPool.pos_x)           |   
-            (obj_pool_poses_rel[..., 0] > (ObjPool.pos_x + 0.27))   |
-            (obj_pool_poses_rel[..., 1] <  ObjPool.pos_y)           |
-            (obj_pool_poses_rel[..., 1] > (ObjPool.pos_y + 0.39))
+            (obj_pool_poses_rel[..., 0] < (Camera.x_cam - 0.135))           |   
+            (obj_pool_poses_rel[..., 0] > (Camera.x_cam + 0.135))   |
+            (obj_pool_poses_rel[..., 1] < (Camera.y_cam - 0.195))           |
+            (obj_pool_poses_rel[..., 1] > (Camera.y_cam + 0.195))
         )
 
         bin_empty = objs_outside_bin.all(dim=1)
@@ -635,10 +632,10 @@ class ObjectGenerator(object):
 
         # Mask out if not in bin
         mask_out = ( # (E, N)
-            (obj_bin_poses_rel[..., 0] <  ObjPool.pos_x)           |   
-            (obj_bin_poses_rel[..., 0] > (ObjPool.pos_x + 0.27))   |
-            (obj_bin_poses_rel[..., 1] <  ObjPool.pos_y)           |
-            (obj_bin_poses_rel[..., 1] > (ObjPool.pos_y + 0.39))
+            (obj_bin_poses_rel[..., 0] < (Camera.x_cam - 0.135))           |   
+            (obj_bin_poses_rel[..., 0] > (Camera.x_cam + 0.135))           |
+            (obj_bin_poses_rel[..., 1] < (Camera.y_cam - 0.195))           |
+            (obj_bin_poses_rel[..., 1] > (Camera.y_cam + 0.195))
         )
 
         # obj_ids_outside_bin = obj_ids[mask_out]
