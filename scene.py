@@ -421,23 +421,24 @@ class FrankaScene(InteractiveScene):
     
     
     def update_grip_stats(self, env_ids: torch.tensor, is_success: bool = True):
+        self.gripped_objs_prev[env_ids] = self.gripped_objs[env_ids]
 
         force_tensor = self.sensors["contact_forces_L"].data.force_matrix_w # (E, 1, N, 3)
         forces = force_tensor.squeeze(1)        # (E, N, 3)
         mag = torch.linalg.norm(forces, dim=-1) # (E, N)
 
         values, obj_ids = mag[env_ids, :].max(dim=-1)
+
+        self.gripped_objs[env_ids] = obj_ids
+
         no_id = (values == 0)
         if no_id.any():
             env_ids_no_id = env_ids[no_id]
 
             obj_ids_pose = self.get_objs_closest_TCP(env_ids_no_id)         
 
-            obj_ids[env_ids_no_id] = obj_ids_pose
+            self.gripped_objs[env_ids_no_id] = obj_ids_pose
 
-
-        self.gripped_objs_prev[env_ids] = self.gripped_objs[env_ids]
-        self.gripped_objs[env_ids] = obj_ids
 
         if is_success:
             self.grip_log[obj_ids.long(), 0] += 1
@@ -630,7 +631,7 @@ class ObjectGenerator(object):
         obj_bin_poses  = obj_pool_poses[view_ids_bin.long()]
         obj_bin_poses  = obj_bin_poses.view(len(env_ids), ObjPool.n_objs_ep, 7)
 
-        obj_bin_poses_rel = obj_bin_poses[..., :2] - self.env_origins[:, :2].unsqueeze(1) # (E, N, 2) - # (E, 1, 2)
+        obj_bin_poses_rel = obj_bin_poses[..., :2] - self.env_origins[env_ids, :2].unsqueeze(1) # (E, N, 2) - # (E, 1, 2)
 
         # Mask out if not in bin
         mask_out = ( # (E, N)

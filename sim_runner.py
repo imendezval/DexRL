@@ -26,14 +26,13 @@ simulation_app = app_launcher.app
 import numpy as np
 np.set_printoptions(suppress=True)
 import torch
-# from isaaclab.utils import convert_to_torch
 
 import gevent
 
 import isaaclab.sim as sim_utils
 from scene import FrankaScene, FrankaSceneCfg, ObjectGenerator
 
-from helpers import Grasp, offset_target_pos
+from helpers import offset_target_pos
 from constants import Settings, Poses
 
 
@@ -255,8 +254,6 @@ def pick_cube(sim: sim_utils.SimulationContext, scene: FrankaScene):
             
             # Bookkeep obj_id grip fail + fail streaks
             scene.update_grip_stats(env_ids, is_success=False)
-            print(scene.fail_streaks)
-            print(scene.gripped_objs)
 
             # Open Gripper and retract safe distance
             scene.q_target_yumi[FAIL_DROP_MASK] = 0.05
