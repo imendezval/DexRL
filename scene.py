@@ -2,16 +2,12 @@ import numpy as np
 np.set_printoptions(suppress=True)
 
 import os, types, logging
-import base64, grequests
-import torch
+import base64, grequests, gevent
 import random, math
+import torch
 
 
 import isaaclab.sim as sim_utils
-import isaacsim.core.utils.prims as prim_utils
-import isaaclab.utils.math as math_utils
-
-import omni.physics.tensors.impl.api as physx
 
 # Interactive Scene Class
 from isaaclab.utils import configclass
@@ -20,12 +16,10 @@ from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 # CFGs
 from cfg.franka_cfg import FRANKA_PANDA_HIGH_PD_CFG
 from cfg.gripper_cfg import YUMI_CFG
-from isaaclab.assets import AssetBaseCfg, RigidObjectCfg, RigidObjectCollectionCfg, RigidObjectCollection
-from isaaclab.assets.articulation import ArticulationCfg, Articulation
+from isaaclab.assets import AssetBaseCfg, RigidObjectCfg, RigidObjectCollectionCfg
+from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.sensors import CameraCfg, TiledCameraCfg
 from isaaclab.sensors import ContactSensorCfg
-import isaaclab.sim.schemas as sim_schemas
-from isaaclab.sim.spawners.spawner_cfg import SpawnerCfg
 
 ### Extensions
 from isaacsim.core.utils.extensions import enable_extension
@@ -43,7 +37,8 @@ from isaacsim.core.prims import SingleArticulation
 
 
 from helpers import Grasp, mat_to_quat, quat_diff_mag, offset_target_pos
-from constants import Camera, Prims, RobotArm, DexNet, Settings
+from constants import Camera, Prims, RobotArm, DexNet, Poses
+from ObjectGenerator import ObjectGenerator
 ObjPool = Prims.ObjPool
 
 dir_ = os.path.dirname(os.path.realpath(__file__))
@@ -54,7 +49,7 @@ ObjPool_filter_paths = [
     for i in range(ObjPool.n_obj_pool)
 ]
 
-class ObjectPool(object):
+class ObjectPoolCfg(object):
 
     def __init__(self):
 
@@ -133,7 +128,7 @@ class FrankaSceneCfg(InteractiveSceneCfg):
     
     # Object Pool
     obj_pool = RigidObjectCollectionCfg(
-                rigid_objects=ObjectPool().object_pool_cfg
+                rigid_objects=ObjectPoolCfg().object_pool_cfg
     )
 
     # Articulations
@@ -170,6 +165,8 @@ class FrankaScene(InteractiveScene):
 
         self.logger = logging.getLogger(__name__)
 
+        self.step_count = 0
+
         self.env_ids = torch.as_tensor([env_id for env_id in range(self.num_envs)], device=self.device)
 
         self._arm_path_loc      = "/Franka/franka_instanceable"
@@ -200,9 +197,10 @@ class FrankaScene(InteractiveScene):
         self.request_state  = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
         # DexNet Grasps
-        self.GRASPS     = torch.zeros(self.num_envs, 3, device=self.device)
-        self.PRE_GRASPS = torch.zeros(self.num_envs, 3, device=self.device)
-        self.GRASPS_ROT = torch.zeros(self.num_envs, 4, device=self.device)
+        self.grasps_DexNet = [None for _ in range(self.num_envs)]
+        self.GRASPS        = torch.zeros(self.num_envs, 3, device=self.device)
+        self.PRE_GRASPS    = torch.zeros(self.num_envs, 3, device=self.device)
+        self.GRASPS_ROT    = torch.zeros(self.num_envs, 4, device=self.device)
 
         # Bookkeeping
         self.gripped_objs      = torch.full((self.num_envs,), -1, 
@@ -213,6 +211,12 @@ class FrankaScene(InteractiveScene):
                                         dtype=torch.uint8, device=self.device)
         self.fail_streaks      = torch.zeros(self.num_envs,
                                         dtype=torch.uint8, device=self.device)
+        
+    
+    def update(self, dt):
+        super().update(dt)
+        self._fsm_tick()
+        self.step_count += 1
 
 
     def setup_post_load(self):
@@ -225,6 +229,25 @@ class FrankaScene(InteractiveScene):
             #sim_schemas.activate_contact_sensors(gripper_path)
 
         self._load_InverseKinematics()
+
+
+    def setup_post_reset(self):
+        # Initialize franka SingleArticulation(s) for IK
+        self.franka_initialize()
+
+        # Initialize ObjectGenerator
+        self.ObjGen = ObjectGenerator(self.rigid_object_collections["obj_pool"], 
+                                        num_envs = self.num_envs,
+                                        env_origins = self.env_origins,
+                                        device = self.device)
+        
+        # Initialize Articulation q_target tensors
+        self.q_target_franka = self.articulations["franka"].data.default_joint_pos.clone()
+
+        self.q_target_yumi = torch.full_like(self.articulations["yumi_gripper"].data.joint_pos, 0.05)
+        self.yumi_vel_vec  = torch.tensor([[0.0, 0.0]],
+                                            device=self.articulations["yumi_gripper"].data.joint_pos.device
+                                            ).repeat(self.num_envs, 1)
 
     
     def _attach_gripper(self, arm_path, gripper_path):
@@ -489,7 +512,7 @@ class FrankaScene(InteractiveScene):
             self.request_state[env_id] = 1
 
 
-    def get_DexNet_pred(self, env_ids, grasps_DexNet):
+    def get_DexNet_pred(self, env_ids):
 
         for env_id in env_ids.cpu().tolist():
             
@@ -510,18 +533,16 @@ class FrankaScene(InteractiveScene):
             
             self.logger.info(f"Received grasp predictions from Dex-Net in {env_id}")
 
-            grasps_DexNet[env_id] = [Grasp(row) for row in grasps_np]
-
-        return grasps_DexNet
+            self.grasps_DexNet[env_id] = [Grasp(row) for row in grasps_np]
     
 
-    def grasps_to_tensors(self, grasps_DexNet, env_ids):
+    def grasps_to_tensors(self, env_ids):
 
         env_ids = env_ids.cpu().tolist()
 
         grasps = torch.stack(
             [torch.as_tensor(offset_target_pos(
-                            grasps_DexNet[env][0].world_pos),
+                            self.grasps_DexNet[env][0].world_pos),
                             device=self.device,
                             dtype=torch.float)
             for env in env_ids]
@@ -529,289 +550,317 @@ class FrankaScene(InteractiveScene):
 
         pre_grasps = torch.stack(
             [torch.as_tensor(offset_target_pos(
-                            grasps_DexNet[env][0].setup_pos),
+                            self.grasps_DexNet[env][0].setup_pos),
                             device=self.device,
                             dtype=torch.float)
             for env in env_ids]
         )
 
         grasps_rot = torch.stack(
-            [torch.as_tensor(grasps_DexNet[env][0].rot_global,
+            [torch.as_tensor(self.grasps_DexNet[env][0].rot_global,
                             device=self.device,
                             dtype=torch.float)
             for env in env_ids]
         )
 
         return grasps, pre_grasps, grasps_rot
+    
 
+    def reset(self, env_ids): # TODO: Vectorize to multiple envs???
+        super().reset(env_ids)
 
-class ObjectGenerator(object):
-    def __init__(self, obj_pool: RigidObjectCollection, num_envs, env_origins, device):
+        # reset joint states to defaults
+        root_state_franka = self.articulations["franka"].data.default_root_state.clone()
+        root_state_gripper = self.articulations["yumi_gripper"].data.default_root_state.clone()
 
-        self.obj_pool = obj_pool
-        self.view     = obj_pool.root_physx_view 
-        self.org_pos  = self.view.get_transforms().clone()
+        # offset entity root states by origin
+        root_state_franka[:, :3] += self.env_origins
+        root_state_gripper[:, :3] += self.env_origins
 
-        self.device      = device
-        self.num_envs    = num_envs
-        self.env_origins = env_origins
+        self.articulations["franka"].write_root_pose_to_sim(root_state_franka[:, :7])
+        self.articulations["franka"].write_root_velocity_to_sim(root_state_franka[:, 7:])
 
-        self.obj_ids          = torch.full((self.num_envs, ObjPool.n_objs_ep), -1, dtype=torch.long, device=self.device)
-        self.is_obj_id_in_bin = torch.ones(self.num_envs, ObjPool.n_objs_ep, dtype=torch.bool, device=self.device)
+        # yumi_gripper pos established by robot assembler
+        #self.articulations["yumi_gripper"].write_root_pose_to_sim(root_state_gripper[:, :7])
+        self.articulations["yumi_gripper"].write_root_velocity_to_sim(root_state_gripper[:, 7:])
 
-
-    def generate_objects(self, env_ids):
-
-        # Remove previous objects
-        if (self.obj_ids[env_ids] != -1).all():
-            self.restart_pool(env_ids)
-
-        # Generate random list of objects and view_ids
-        obj_ids = torch.stack(
-            [torch.tensor(sorted(random.sample(range(ObjPool.n_obj_pool), ObjPool.n_objs_ep)),
-                          device=self.device)
-            for _ in range(len(env_ids))]
-        )
-        self.obj_ids[env_ids] = obj_ids # (E, N)
-
-        view_ids = self._env_obj_ids_to_view_ids_abstract(env_ids, obj_ids).to(torch.uint32)
-
-        # Randomise Domain
-        self._randomise_friction(view_ids)
-
-        self._randomise_mass(view_ids)
-
-        self._randomise_poses(view_ids, env_ids, obj_ids)
-
-        # Visibility???
-        ...
-
-
-    def is_bin_empty(self, env_ids):
-
-        obj_pool_poses = self.view.get_transforms()
-        obj_pool_poses = obj_pool_poses.view(self.num_envs, -1, 7)
-        obj_pool_poses = obj_pool_poses[env_ids, ...]
-
-        obj_pool_poses_rel = obj_pool_poses[..., :2] - self.env_origins[env_ids, :2].unsqueeze(1) # (E, N, 2) - # (E, 1, 2)
-
-        objs_outside_bin = ( # (E, N)
-            (obj_pool_poses_rel[..., 0] < (Camera.x_cam - 0.135))           |   
-            (obj_pool_poses_rel[..., 0] > (Camera.x_cam + 0.135))   |
-            (obj_pool_poses_rel[..., 1] < (Camera.y_cam - 0.195))           |
-            (obj_pool_poses_rel[..., 1] > (Camera.y_cam + 0.195))
+        # set default joint position
+        joint_pos_franka, joint_vel_franka = (
+            self.articulations["franka"].data.default_joint_pos.clone(),
+            self.articulations["franka"].data.default_joint_vel.clone(),
         )
 
-        bin_empty = objs_outside_bin.all(dim=1)
-        return bin_empty
+        self.articulations["franka"].write_joint_state_to_sim(joint_pos_franka, joint_vel_franka)
 
+        joint_pos_gripper, joint_vel_gripper = (
+            self.articulations["yumi_gripper"].data.default_joint_pos,
+            self.articulations["yumi_gripper"].data.default_joint_vel,
+        ) 
+        self.articulations["yumi_gripper"].write_joint_state_to_sim(joint_pos_gripper, joint_vel_gripper)
 
-    def remove_objs(self, env_ids, obj_ids):
+        self.logger.info("Franka Reset.")
 
-        view_ids = self._env_obj_ids_to_view_ids_abstract(env_ids, obj_ids).to(torch.uint32)
-        object_poses = self.org_pos[view_ids.long()]
-
-        self.write_object_pose_to_sim_abstract(object_poses.view(len(env_ids), -1, 7), view_ids, env_ids, obj_ids)
-    
-
-    def restart_pool(self, env_ids):
-
-        self.remove_objs(env_ids, self.obj_ids[env_ids])
+        self.step_count = 0
 
     
-    def clean_pool(self, env_ids):
-        # Get Poses of current objects in bin
-        obj_ids       = self.obj_ids[env_ids]
-        view_ids_bin  = self._env_obj_ids_to_view_ids_abstract(env_ids, obj_ids).to(torch.uint32)
+    def _fsm_tick(self):
+        # ──────────────────
+        # Picking Sequence
+        # ──────────────────
 
-        obj_pool_poses = self.view.get_transforms()
-        obj_bin_poses  = obj_pool_poses[view_ids_bin.long()]
-        obj_bin_poses  = obj_bin_poses.view(len(env_ids), ObjPool.n_objs_ep, 7)
+        # -2    regenerate
+        # -1    clean
+        # 0     SETUP, Request
+        # 1     PRE_GRASP
+        # 2     GRASP
+        # 3     Close Gripper
+        # 4     LIFT
+        # 5     INTER, identify obj_ids
+        # 6     DROP
+        # 7     Open Gripper
+        # 8     INTER
+        # 9     Restart cycle - regenerate (-2) or not (0)
 
-        obj_bin_poses_rel = obj_bin_poses[..., :2] - self.env_origins[env_ids, :2].unsqueeze(1) # (E, N, 2) - # (E, 1, 2)
 
-        # Mask out if not in bin
-        mask_out = ( # (E, N)
-            (obj_bin_poses_rel[..., 0] < (Camera.x_cam - 0.135))           |   
-            (obj_bin_poses_rel[..., 0] > (Camera.x_cam + 0.135))           |
-            (obj_bin_poses_rel[..., 1] < (Camera.y_cam - 0.195))           |
-            (obj_bin_poses_rel[..., 1] > (Camera.y_cam + 0.195))
+        DEXNET_MASK = (self.request_state == 1)
+        if DEXNET_MASK.any():
+            env_ids = DEXNET_MASK.nonzero(as_tuple=False).flatten()
+
+            self.get_DexNet_pred(env_ids)
+
+        gevent.sleep(0)
+
+
+        REGENERATE_MASK = (self.mode == -2)
+        if REGENERATE_MASK.any():
+            env_ids = REGENERATE_MASK.nonzero(as_tuple=False).flatten()
+
+            self.logger.info(f"Object Generator started in {env_ids.cpu().tolist()}")
+
+            self.ObjGen.generate_objects(env_ids)
+            self.counter[REGENERATE_MASK] = self.step_count + 120 # Wait - cleaning pool
+
+            self.mode[REGENERATE_MASK] = -1
+
+        
+        CLEAN_MASK = (self.mode == -1) & self.is_counter_reached(self.step_count)
+        if CLEAN_MASK.any():
+            env_ids = CLEAN_MASK.nonzero(as_tuple=False).flatten()
+
+            self.ObjGen.clean_pool(env_ids)
+            self.counter[CLEAN_MASK] = self.step_count + 6 # Wait - DexNet scan
+
+            self.mode[env_ids] = 0
+
+
+        SETUP_MASK = (self.mode == 0) & self.is_counter_reached(self.step_count)
+        if SETUP_MASK.any():
+            env_ids = SETUP_MASK.nonzero(as_tuple=False).flatten()
+
+            self.request_DexNet_pred(env_ids)
+            self.q_target_franka = self.compute_IK(Poses.setup, Poses.base_rot, env_ids)
+
+            self.mode[SETUP_MASK] = 1
+
+
+        PRE_GRASP_MASK = ((self.mode == 1) &
+                          self.is_target_reached(Poses.setup, Poses.base_rot) &
+                          (self.request_state == 2))
+        if PRE_GRASP_MASK.any():
+            env_ids = PRE_GRASP_MASK.nonzero(as_tuple=False).flatten()
+
+            self.logger.info(f"SETUP position reached in {env_ids.cpu().tolist()}.")
+            
+            grasps, pre_grasps, grasps_rot = self.grasps_to_tensors(env_ids)
+
+            self.GRASPS[PRE_GRASP_MASK]     = grasps
+            self.PRE_GRASPS[PRE_GRASP_MASK] = pre_grasps
+            self.GRASPS_ROT[PRE_GRASP_MASK] = grasps_rot
+
+            self.q_target_franka = self.compute_IK(self.PRE_GRASPS, self.GRASPS_ROT, env_ids, is_tensor=True)
+
+            self.mode[PRE_GRASP_MASK] = 2
+
+
+        GRASP_MASK = (self.mode == 2) & self.is_target_reached(self.PRE_GRASPS, self.GRASPS_ROT, is_tensor=True)
+        if GRASP_MASK.any():
+            env_ids = GRASP_MASK.nonzero(as_tuple=False).flatten()
+
+            self.logger.info(f"PRE-GRASP position reached in {env_ids.cpu().tolist()}.")
+
+            self.compute_IK_trajectory(self.GRASPS, self.PRE_GRASPS, self.GRASPS_ROT, env_ids, self.step_count)
+
+            self.mode[GRASP_MASK]    = 3 
+            self.counter[GRASP_MASK] = self.step_count + 120 # Wait - Clamp sequence fail check
+
+        
+        UPDATE_TRAYECTORY_MASK = (self.mode == 3)
+        if UPDATE_TRAYECTORY_MASK.any():
+            env_ids = UPDATE_TRAYECTORY_MASK.nonzero(as_tuple=False).flatten()
+            
+            self.q_target_franka = self.update_IK_trajectory(env_ids, self.step_count)
+
+
+        CLOSE_GRIPPER_MASK = (self.mode == 3) & self.is_target_reached(self.GRASPS, self.GRASPS_ROT, is_tensor=True, atol=5e-3)
+        if CLOSE_GRIPPER_MASK.any():
+            env_ids = CLOSE_GRIPPER_MASK.nonzero(as_tuple=False).flatten()
+
+            self.logger.info(f"GRASP position reached - Closing Gripper in {env_ids.cpu().tolist()}.")
+
+            self.q_target_yumi[CLOSE_GRIPPER_MASK] = 0
+            self.yumi_vel_vec[CLOSE_GRIPPER_MASK]  = -1
+
+            self.mode[CLOSE_GRIPPER_MASK] = 4
+
+
+        LIFT_MASK = (self.mode == 4) & self.is_obj_clamped()
+        if LIFT_MASK.any():
+            env_ids = LIFT_MASK.nonzero(as_tuple=False).flatten()
+
+            self.logger.info(f"Object gripped in {env_ids.cpu().tolist()}.")
+
+            self.q_target_franka = self.compute_IK(self.PRE_GRASPS, self.GRASPS_ROT, env_ids, is_tensor=True)
+
+            self.mode[LIFT_MASK]    = 5
+            self.counter[LIFT_MASK] = -1
+
+
+        ### FAILURES ###
+        FAIL_GRIP_MASK = (
+                (((self.mode == 3) | (self.mode == 4)) & self.is_counter_reached(self.step_count)) |
+                ((self.mode == 5) & (~self.is_obj_clamped(thresh=0.1)))
         )
+        if FAIL_GRIP_MASK.any(): # GRASP POSITION NOT REACHED / CLAMP WAS BAD (didnt reach pre-grasp)
+            env_ids = FAIL_GRIP_MASK.nonzero(as_tuple=False).flatten()
 
-        # obj_ids_outside_bin = obj_ids[mask_out]
-        # Cannot be done in parallel since different N objects per env possible
-        # then obj_ids_outside_bin.shape == (K, ), doesn´t work for -> view_ids + object_state_w
-        for i, env_id in enumerate(env_ids):
+            self.logger.info(f"FAIL - GRIP in {env_ids.cpu().tolist()} - RESTARTING SEQUENCE.")
 
-            if not mask_out[i].any():
-                continue
+            # Bookkeep obj_id grip fail + fail streaks
+            self.update_grip_stats(env_ids, is_success=False)
 
-            env_id = env_id.view(-1) 
+            # Open Gripper and retract safe distance
+            self.q_target_yumi[FAIL_GRIP_MASK] = 0.05
+            self.yumi_vel_vec[FAIL_GRIP_MASK]  = 1
+            self.q_target_franka = self.compute_IK(self.PRE_GRASPS, self.GRASPS_ROT, env_ids, is_tensor=True)
 
-            obj_ids_outside_bin = obj_ids[i, mask_out[i]].unsqueeze(0) # (N, ) -> (1, N)
+            self.mode[FAIL_GRIP_MASK]    = 8
+            self.counter[FAIL_GRIP_MASK] = self.step_count + 30 # Wait - retract safe distance
 
-            # Get original poses of masked out objects
-            view_ids_bin_out     = self._env_obj_ids_to_view_ids_abstract(env_id, obj_ids_outside_bin).to(torch.uint32)
-            object_poses_bin_out = self.org_pos[view_ids_bin_out.long()]
+        
+        FAIL_DROP_MASK = (
+                ((self.mode == 6) | (self.mode == 7)) &
+                (~self.is_obj_clamped(thresh=0.1))
+        )
+        if FAIL_DROP_MASK.any(): # OBJECT DROPPED EARLY
+            env_ids = FAIL_DROP_MASK.nonzero(as_tuple=False).flatten()
+            
+            self.logger.info(f"FAIL - DROP in {env_ids.cpu().tolist()} - RESTARTING SEQUENCE.")
+            
+            # Bookkeep obj_id grip fail + fail streaks
+            self.update_grip_stats(env_ids, is_success=False)
 
-            self.write_object_pose_to_sim_abstract(object_poses_bin_out.view(1, -1, 7), view_ids_bin_out, env_id, obj_ids_outside_bin)
+            # Open Gripper and retract safe distance
+            self.q_target_yumi[FAIL_DROP_MASK] = 0.05
+            self.yumi_vel_vec[FAIL_DROP_MASK]  = 1
+
+            ee_poses, ee_rots = self.get_curr_poses()
+            ee_poses[:, 2] += 0.15
+            self.q_target_franka = self.compute_IK(ee_poses, ee_rots, env_ids, is_tensor=True)
+
+
+            self.mode[FAIL_DROP_MASK]    = 8
+            self.counter[FAIL_DROP_MASK] = self.step_count + 30 # Wait - retract safe distance
         
 
-        self.is_obj_id_in_bin[env_ids] = ~mask_out
+        REMOVE_OBJ_MASK = (FAIL_GRIP_MASK | FAIL_DROP_MASK) & (self.fail_streaks == 2)
+        if REMOVE_OBJ_MASK.any():
+            env_ids = REMOVE_OBJ_MASK.nonzero(as_tuple=False).flatten()
+            
+            self.logger.info(f"Object grip failed 3 consecutive times in {env_ids.cpu().tolist()} - removing.")
+            ...
+
+            self.ObjGen.remove_objs(env_ids, self.gripped_objs[env_ids].unsqueeze(1)) # (E, 1)
 
 
-    def _randomise_friction(self, view_ids: torch.tensor):
-
-        S = self.view.max_shapes
-        N = ObjPool.n_obj_pool * Settings.num_envs # == view.count
-
-        mean_fric = torch.tensor([ObjPool.mu_static,
-                                  ObjPool.mu_dynamic],
-                                  dtype=torch.float32).view(1, 2).expand(N, 2)
+        INTER_MASK = (self.mode == 5) & self.is_target_reached(self.PRE_GRASPS, self.GRASPS_ROT, is_tensor=True, atol=1e-2)
+        if INTER_MASK.any():
+            env_ids = INTER_MASK.nonzero(as_tuple=False).flatten()
         
-        std_fric  = torch.full_like(mean_fric, ObjPool.sigma)
-        friction  = torch.normal(mean_fric, std_fric)
+            self.logger.info(f"LIFT position reached in {env_ids.cpu().tolist()}.")
 
-        mean_rest   = torch.full((N, 1), ObjPool.mu_rest,  dtype=torch.float32)
-        std_rest    = torch.full((N, 1), ObjPool.sigma_rest, dtype=torch.float32)
-        restitution = torch.normal(mean_rest, std_rest)
-        # TODO: Static > Dynamic
+            self.q_target_franka = self.compute_IK(Poses.inter, Poses.base_rot, env_ids)
+
+            self.mode[INTER_MASK] = 6
+
+
+        DROP_MASK = (self.mode == 6) & self.is_target_reached(Poses.inter, Poses.base_rot, atol=1e-2)
+        if DROP_MASK.any():
+            env_ids = DROP_MASK.nonzero(as_tuple=False).flatten()
+            
+            self.logger.info(f"INTER position reached in {env_ids.cpu().tolist()}.")
+
+            self.q_target_franka = self.compute_IK(Poses.drop, Poses.base_rot, env_ids)
+
+            self.mode[DROP_MASK] = 7
+            
+
+        OPEN_GRIPPER_MASK = (self.mode == 7) & self.is_target_reached(Poses.drop, Poses.base_rot, atol=1e-2)
+        if OPEN_GRIPPER_MASK.any():
+            env_ids = OPEN_GRIPPER_MASK.nonzero(as_tuple=False).flatten()
+
+            self.logger.info(f"DROP position reached - Opening Gripper in {env_ids.cpu().tolist()}.")
+
+            # Bookkeep obj_id grip success
+            self.update_grip_stats(env_ids, is_success=True)
+
+            self.q_target_yumi[OPEN_GRIPPER_MASK] = 0.05
+            self.yumi_vel_vec[OPEN_GRIPPER_MASK]  = 1
+
+            self.counter[OPEN_GRIPPER_MASK] = self.step_count + 50
+
+            self.mode[OPEN_GRIPPER_MASK] = 8
+
         
-        properties = torch.cat([friction, restitution], dim=1) # (N, 3)
-        properties = properties.unsqueeze(1)                   # (N, 1, 3)
-        properties = properties.expand(N, S, 3).clone()        # (N, S, 3)  
-        properties = properties.cpu()
+        INTER_MASK2 = (self.mode == 8) & self.is_counter_reached(self.step_count)
+        if INTER_MASK2.any():
+            env_ids = INTER_MASK2.nonzero(as_tuple=False).flatten()
 
-        self.view.set_material_properties(properties, indices=view_ids.cpu())
+            self.logger.info(f"Heading to INTER to restart sequence in {env_ids.cpu().tolist()}.")
+            
+            self.q_target_franka = self.compute_IK(Poses.inter, Poses.base_rot, env_ids)
 
-
-    def _randomise_mass(self, view_ids: torch.tensor):
-
-        N = ObjPool.n_obj_pool * Settings.num_envs # == view.count
-
-        mean_mass   = torch.full((N, 1), ObjPool.mu_rest,  dtype=torch.float32)
-        std_mass    = torch.full((N, 1), ObjPool.sigma_rest, dtype=torch.float32)
-        mass        = torch.normal(mean_mass, std_mass).cpu()
-
-        self.view.set_masses(mass, indices=view_ids.cpu())
+            self.mode[INTER_MASK2] = 9
 
 
-    def _randomise_poses(self, 
-                         view_ids: torch.tensor, 
-                         env_ids:  torch.tensor, 
-                         obj_ids:  torch.tensor):
+        RESTART_MASK = (self.mode == 9) & self.is_target_reached(Poses.inter, Poses.base_rot)
+        if RESTART_MASK.any():
+            env_ids = RESTART_MASK.nonzero(as_tuple=False).flatten()
 
-        N = ObjPool.n_objs_ep
+            self.logger.info(f"Restarting Picking Sequence in {env_ids.cpu().tolist()}.")
 
-        xy = torch.stack([
-            self._sample_discrete_xy_bins(ObjPool.x_bins, 
-                                            ObjPool.y_bins, 
-                                            ObjPool.spacing,
-                                            ObjPool.pos_x,
-                                            ObjPool.pos_y,
-                                            N, env_id)
-            for env_id in env_ids.cpu().tolist()]) # (E, N, 2)
+            self.GRASPS[RESTART_MASK]        = 0
+            self.PRE_GRASPS[RESTART_MASK]    = 0
+            self.GRASPS_ROT[RESTART_MASK]    = 0
+            self.request_state[RESTART_MASK] = 0
 
-        z  = torch.empty((len(env_ids), N, 1), device=self.device).uniform_(ObjPool.z_min, ObjPool.z_max) # (E, N, 1)
-        
-        poses_3d    = torch.cat([xy, z], dim=2)                         # (E, N, 3)
 
-        quartenions = self._sample_uniform_quaternions(N, len(env_ids)) # (E, N, 4)
+            EMPTY_BIN_MASK = self.ObjGen.is_bin_empty(env_ids)
+            env_ids_empty_bin = env_ids[EMPTY_BIN_MASK]
+            env_ids_full_bin  = env_ids[~EMPTY_BIN_MASK]
 
-        object_poses = torch.cat([poses_3d, quartenions], dim=2)        # (E, N, 7)
-       
-        self.write_object_pose_to_sim_abstract(object_poses, view_ids, env_ids, obj_ids)
+            self.mode[env_ids_full_bin]  = 0
+            self.mode[env_ids_empty_bin] = -2
+
+            self.fail_streaks[env_ids_empty_bin] = 0
+            self.gripped_objs[env_ids_empty_bin] = -1
+
+            # TODO: Reposition bin if moved + regenerate?
+            # TODO: q of action = 0 case
+            # TODO: Gripper friction unpaired
+
+        # apply actions to gripper
+        self.articulations["yumi_gripper"].set_joint_velocity_target(self.yumi_vel_vec)
+        self.articulations["yumi_gripper"].set_joint_position_target(self.q_target_yumi)       
+        self.articulations["franka"].set_joint_position_target(self.q_target_franka)
 
     
-    def _sample_discrete_xy_bins(self,
-                                n_bins_x: int,
-                                n_bins_y: int,
-                                spacing:  float,
-                                x0:       float,
-                                y0:       float,
-                                N:        int,
-                                env_id:   int):
-        """
-        Pick N unique (x,y) bins on a regular grid.
-
-        Parameters
-        ----------
-        n_bins_x, n_bins_y : int
-            Number of bins along each axis.
-        N : int
-            How many unique positions you need.
-        """
-        # TODO: Improve to take in center of Bin and its size
-
-        x0_env = x0 + self.env_origins[env_id, 0]
-        y0_env = y0 + self.env_origins[env_id, 1]
-
-        # (n_bins_x · n_bins_y, 2) table of (i,j) integer indices
-        ij = torch.stack(torch.meshgrid(
-                torch.arange(n_bins_x, device=self.device),
-                torch.arange(n_bins_y, device=self.device),
-                indexing="ij"), dim=-1
-            ).reshape(-1, 2)
-
-        # take N different rows without replacement
-        chosen = ij[torch.randperm(ij.size(0), device=self.device)[:N]]
-
-        # convert bin indices to metric coordinates
-        xy = (chosen.float() + 0.5) * spacing
-        xy += torch.tensor([x0_env, y0_env], device=self.device)
-        return xy
-
-
-    def _sample_uniform_quaternions(self, N: int, E: int):
-        """
-        Marsaglia 1972 method — uniform over SO(3).
-
-        Returns
-        -------
-        q : torch.Tensor, shape (E, N, 4)  (w, x, y, z)
-        """
-        u1, u2, u3 = torch.rand(3, E, N, device=self.device)
-
-        q = torch.zeros((E, N, 4), device=self.device)
-        q[..., 0] = torch.sqrt(1.0 - u1) * torch.sin(2 * math.pi * u2)   # x
-        q[..., 1] = torch.sqrt(1.0 - u1) * torch.cos(2 * math.pi * u2)   # y
-        q[..., 2] = torch.sqrt(      u1) * torch.sin(2 * math.pi * u3)   # z
-        q[..., 3] = torch.sqrt(      u1) * torch.cos(2 * math.pi * u3)   # w
-        return q[..., (3, 0, 1, 2)]
-    
-
-    def _env_obj_ids_to_view_ids_abstract(
-        self, env_ids: torch.Tensor, object_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        ...
-
-        Parameters
-        ----------
-        env_ids: Tensor
-            (E,)
-        object_ids : Tensor
-            (E, N)
-        """
-        view_ids = (object_ids * self.num_envs + env_ids.unsqueeze(1)).flatten()
-
-        return view_ids
-
-
-    def write_object_pose_to_sim_abstract(
-        self,
-        object_pose: torch.Tensor,
-        view_ids,
-        env_ids: torch.Tensor | None = None,
-        object_ids: slice | torch.Tensor | None = None,
-    ):
-
-        # set into internal buffers
-        self.obj_pool._data.object_state_w[env_ids[:, None], object_ids, :7] = object_pose.clone()
-        
-        # convert the quaternion from wxyz to xyzw
-        poses_xyzw = self.obj_pool._data.object_state_w[..., :7].clone()
-        poses_xyzw[..., 3:] = math_utils.convert_quat(poses_xyzw[..., 3:], to="xyzw")
-
-        # set into simulation
-        self.view.set_transforms(self.obj_pool.reshape_data_to_view(poses_xyzw), indices=view_ids)
