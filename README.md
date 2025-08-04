@@ -1,93 +1,136 @@
-# cobot_reacher
+# DexRL
+Integration of BerkleyAutomation's Grasp Quality Convolutional Neural Networks (GQ-CNN) into NVIDIA`s Isaac Lab. Enhancement of Grasp Proposals from the FC-GQ-CNN with a one-step MDP RL Agent.
 
 
+<img src="https://skillicons.dev/icons?i=python" /> <img src="https://skillicons.dev/icons?i=pytorch" />
+<img src="https://icon-icons.com/icon/nvidia-settings/20941" />
 
-## Getting started
+Click on the video below for a Demo!
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+<div align="center">
+  <a href="https://www.youtube.com/watch?v=9fAv8-oUtLc&ab_channel=M3NDEZ">
+    <img src="https://img.youtube.com/vi/9fAv8-oUtLc/0.jpg" alt="Watch the video">
+  </a>
+</div>
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+Taking advantage of Isaac Lab's functionality for a faster parallelised training of RL agents, the integration of GQCNN was scaled to work on multiple environments independently, each with its own domain randomisation.
 
-## Add your files
+Below is another video - click on it for a Demo showcasing multiple environments.
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
 
-```
-cd existing_repo
-git remote add origin https://git-research.it.hs-heilbronn.de/aitraqc/research_and_prototyping/cobot_reacher.git
-git branch -M main
-git push -uf origin main
-```
+## Ambition
+Today's rise in the power and fidelity to reality of simulators gives place for better and better grounds to develop RL agents. Hypothetically, with a simulator that is 100% true to reality, a Reinforcement Learning agent is only limited to its architecture and to the availability of computational power. No self-supervision is involved in RL, meaning there is no labeled dataset involved - with enough training episodes, enough computational power, and a good architecture, an agent can be trained to perform optimally at a given task.
 
-## Integrate with your tools
 
-- [ ] [Set up project integrations](https://git-research.it.hs-heilbronn.de/aitraqc/research_and_prototyping/cobot_reacher/-/settings/integrations)
+I don't have enough knowledge about RL, enough computational resources, or an ideal simulator - however I do have ambition and a will to delve into the world of RL and simulations, so I thought it was a good idea to start by building a somewhat simple scene in Isaac Lab and developing a small agent in it.
 
-## Collaborate with your team
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## Aim
+With this in mind, attempting to take advantage of the power of a simulator, the aim of this project is to test whether CNN-based grasp predictions, such as the ones from Dex-Net's Fully Connected GQCNN, can be improved with an RL agent. Dex-Net's FC-GQCNN predictions work approximately ~95% of the time, which is extremely impressive and still state-of-the-art today, 5 years later, in terms of overall performance and inference time.
 
-## Test and Deploy
 
-Use the built-in continuous integration in GitLab.
+This project attempts to:
++ close that ~5% gap when exposed to the same objects
++ see whether, if exposed to new object types (smaller, more abstract...), a simple RL agent with minimal fine tuning can help the pipeline adapt and avoid failed grasps
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+This second aim would, in my opinion, prove very useful in the current industry - one were smart factories are becoming more and more common, and a robot arm may be exposed to different objects over different seasons, and a minimal fine tune back in a simulator, followed by a sim2real transfer, could solve the problem.
 
-***
 
-# Editing this README
+## Methodology
+The development of this project was split into two very distinct stages.
+1. Full integration of DexNet's GQCNN into Isaac Lab
+2. Training of a one-step SAC RL agent to enhance the GQCNN's grasp proposals
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+Currently, the project is in the second phase. For the RL Agent, a ManagerBasedRLEnv is being developed to wrap the whole pipeline, together with stable-baseline3's Soft-Actor-Critic policy wrapper.
 
-## Suggestions for a good README
+Challenges included in the first phase, included:
++ Learning the Isaac Lab conventionality
+In multiple aspects, from developing a simple scene to learning how to fully vectorize a Finite-State-Machine process over multiple environments.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
++ Handling domain randomisation in a vectorized way
+Done using RigidBodyView, handling tensors in a specific way to randomize masses, positions and dynamic / static friction.
 
-## Name
-Choose a self-explaining name for your project.
++ Setting up Dex-Net's GQCNN module to work on my RTX 4070 GPU
+The GQCNN module works on tensorflow 1.15 - the original wheel is not built to be compatible with CC 8.9 (Ada Loverance GPUs).
+The NVIDIA community maintains wheels for newer GPUs / CUDAs, but only from python >= 3.8 - officialy not the case of the GQCNN module and never tested, luckily it worked out.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
++ Handling the discrepancy in between the environments required by the GQCNN module and the Isaac Lab simulation
+Using grequests and gevent for efficient communication between environments to set up a Client-Server configuration.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
 
 ## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+To be able to run the project, setting up both Isaac Lab and DexNet in separate environments is necessary.
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+First, clone this repository and the GQCNN module inside of it.
+```bash
+# Clone DexRL
+git clone https://github.com/imendezval/DexRL.git
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+cd ./DexRL/DexNet
+# Clone GQCNN
+git clone https://github.com/BerkeleyAutomation/gqcnn.git
+```
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+Then, set up the environments:
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+#### GQCNN  
+Omit steps 2 and 3 if your GPU (and its Compute Capability) is compatible with the original tensorflow 1.15 (CC <= 7.5)
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+1. Create and activate a Python 3.8 environment.
+2. Install NVIDIA TensorFlow wheel and TensorBoard:
+```bash
+pip install --extra-index-url https://developer.download.nvidia.com/compute/redist nvidia-tensorflow==1.15.5+nv23.03 nvidia-tensorboard
+```
+3. Comment out the get_tf_dep() functions from GQCNN's setup.py
+4. Set up GQCNN module:
+```bash
+pip install -e .
+```
+5. Install required packages:
+```bash
+pip install Flask gevent
+```
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+#### Isaac Lab
+1. Set up the basic Isaac Lab environment using conda following the [documentation](https://isaac-sim.github.io/IsaacLab/v1.0.0/source/setup/installation/binaries_installation.html).
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+2. Install required packages:
+```bash
+pip install grequests gevent
+```
 
-## License
-For open source projects, say how it is licensed.
+## Structure
+Below, the structure of the repository is represented as a tree diagram:
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+```bash
+DexRL
+├───sim_runner.py
+├───scene.py
+├───helpers.py
+├───constants.py
+├───DexNet
+│   ├───DexNetServer.py
+│   ├───DexNetWrapper.py
+│   └───gqcnn   # the original GQCNN module
+├───assets
+│   ├───franka
+│   ├───yumi_gripper    
+│   ├───meshes
+│   └───small_KLT.usd
+│   └───table_instanceable.usd
+├───cfg
+│   ├───franka_cfg.py
+│   ├───yumi_gripper.py   
+└───tools
+    └───OBJtoUSD.py
+    └───OBJtoUSD.py
+```
+
+
+## Contact
+For any questions or feedback, please reach out to:
+- **Email**: [imendezval@stud.hs-heilbronn.de](mailto:imendezval@stud.hs-heilbronn.de) or [inigomendezval@gmail.com](mailto:inigomendezval@gmail.com)
+- **GitHub Profile**: [imendezval](https://github.com/imendezval)
+- **LinkedIn**: [inigo-miguel-mendez-valero](https://www.linkedin.com/in/i%C3%B1igo-miguel-m%C3%A9ndez-valero-4ba3732b1/)
+
+Feel free to open an issue on GitHub or contact us in any way if you have any queries or suggestions.
