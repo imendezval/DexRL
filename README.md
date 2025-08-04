@@ -3,19 +3,25 @@ Integration of BerkleyAutomation's Grasp Quality Convolutional Neural Networks (
 
 
 <img src="https://skillicons.dev/icons?i=python" /> <img src="https://skillicons.dev/icons?i=pytorch" />
-<img src="https://icon-icons.com/icon/nvidia-settings/20941" />
+<img src="https://github.com/LelouchFR/skill-icons/blob/main/assets/nvidia-auto.svg" />
 
 Click on the video below for a Demo!
 
 <div align="center">
-  <a href="https://www.youtube.com/watch?v=9fAv8-oUtLc&ab_channel=M3NDEZ">
-    <img src="https://img.youtube.com/vi/9fAv8-oUtLc/0.jpg" alt="Watch the video">
+  <a href="https://www.youtube.com/watch?v=BdTGw4hR2kM&ab_channel=M3NDEZ">
+    <img src="https://img.youtube.com/vi/BdTGw4hR2kM/0.jpg" alt="Watch the video">
   </a>
 </div>
 
 Taking advantage of Isaac Lab's functionality for a faster parallelised training of RL agents, the integration of GQCNN was scaled to work on multiple environments independently, each with its own domain randomisation.
 
 Below is another video - click on it for a Demo showcasing multiple environments.
+
+<div align="center">
+  <a href="https://www.youtube.com/watch?v=9fAv8-oUtLc&ab_channel=M3NDEZ">
+    <img src="https://img.youtube.com/vi/9fAv8-oUtLc/0.jpg" alt="Watch the video">
+  </a>
+</div>
 
 
 ## Ambition
@@ -45,16 +51,20 @@ Currently, the project is in the second phase. For the RL Agent, a ManagerBasedR
 
 Challenges included in the first phase, included:
 + Learning the Isaac Lab conventionality
+
 In multiple aspects, from developing a simple scene to learning how to fully vectorize a Finite-State-Machine process over multiple environments.
 
 + Handling domain randomisation in a vectorized way
+
 Done using RigidBodyView, handling tensors in a specific way to randomize masses, positions and dynamic / static friction.
 
 + Setting up Dex-Net's GQCNN module to work on my RTX 4070 GPU
+
 The GQCNN module works on tensorflow 1.15 - the original wheel is not built to be compatible with CC 8.9 (Ada Loverance GPUs).
 The NVIDIA community maintains wheels for newer GPUs / CUDAs, but only from python >= 3.8 - officialy not the case of the GQCNN module and never tested, luckily it worked out.
 
 + Handling the discrepancy in between the environments required by the GQCNN module and the Isaac Lab simulation
+
 Using grequests and gevent for efficient communication between environments to set up a Client-Server configuration.
 
 
