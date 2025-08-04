@@ -3,7 +3,7 @@ Integration of BerkleyAutomation's Grasp Quality Convolutional Neural Networks (
 
 
 <img src="https://skillicons.dev/icons?i=python" /> <img src="https://skillicons.dev/icons?i=pytorch" />
-<img src="https://github.com/LelouchFR/skill-icons/blob/main/assets/nvidia-auto.svg" />
+<img src="https://github.com/LelouchFR/skill-icons/blob/main/assets/nvidia-auto.svg" width="50" height="50"/>
 
 Click on the video below for a Demo!
 
