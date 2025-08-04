@@ -24,8 +24,17 @@ Below is another video - click on it for a Demo showcasing multiple environments
 </div>
 
 
-## Ambition
-Today's rise in the power and fidelity to reality of simulators gives place for better and better grounds to develop RL agents. Hypothetically, with a simulator that is 100% true to reality, a Reinforcement Learning agent is only limited to its architecture and to the availability of computational power. No self-supervision is involved in RL, meaning there is no labeled dataset involved - with enough training episodes, enough computational power, and a good architecture, an agent can be trained to perform optimally at a given task.
+## 📚 Original Work
+DexRL builds on previous work by [BerkleyAutomation](https://github.com/BerkeleyAutomation) which can be found here:
+
+- [Dex-Net Project Website](https://berkeleyautomation.github.io/dex-net/)
+- [Dex-Net Documentation](https://berkeleyautomation.github.io/dex-net/code.html)  
+- [GQCNN Module](https://github.com/BerkeleyAutomation/gqcnn.git)
+
+
+
+## Motivation
+Today's rise in the power and fidelity to reality of simulators gives place for better and better grounds to develop RL agents. Hypothetically, with a simulator that fully matches reality, a Reinforcement Learning agent would mainly limited to its architecture and to the availability of computational power. The self-supervision employed in RL does not involve a labeled dataset, so - with enough training episodes, enough computational power, and a good architecture, an agent can be trained to perform optimally at a given task.
 
 
 I don't have enough knowledge about RL, enough computational resources, or an ideal simulator - however I do have ambition and a will to delve into the world of RL and simulations, so I thought it was a good idea to start by building a somewhat simple scene in Isaac Lab and developing a small agent in it.
